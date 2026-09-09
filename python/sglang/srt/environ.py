@@ -874,8 +874,9 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
-    # Enable dual-stream MoE (shared experts vs routed experts) on the
-    # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
+    # Enable multi-stream execution for supported MoE and context-parallel paths on
+    # ROCm/AITER. This does not enable the CUDA-only DSA indexer dual-stream path.
+    # Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
