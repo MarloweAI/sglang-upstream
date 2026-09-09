@@ -9,11 +9,13 @@ from einops import rearrange
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
-    DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.dual_stream import (
+    can_use_dsa_indexer_dual_stream,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -83,6 +85,7 @@ class IndexerKPool(MultiPlatformOp):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.compress_gate_stream = None
+        self.half_device_sm_count: Optional[int] = None
         self.skip_rope = skip_rope
 
         self.index_kpool = config.index_kpool
@@ -1412,8 +1415,9 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and can_use_dsa_indexer_dual_stream(
+                q_lora.shape[0], is_cuda=is_cuda(), is_hip=is_hip()
+            )
             # The BCG eager break must finish its indexer work before starting
             # the next capture segment; keep its projections on one stream.
             and not (

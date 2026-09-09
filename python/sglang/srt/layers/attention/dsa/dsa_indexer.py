@@ -23,6 +23,9 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dual_stream import (
+    can_use_dsa_indexer_dual_stream,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -130,9 +133,6 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-
-
-DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda or _is_hip:
@@ -250,6 +250,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not is_neox_style
         )
         self.alt_stream = alt_stream
+        self.half_device_sm_count: Optional[int] = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -1536,8 +1537,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and can_use_dsa_indexer_dual_stream(
+                q_lora.shape[0], is_cuda=_is_cuda, is_hip=_is_hip
+            )
         )
 
         # Determine if should skip topk based on sequence length
