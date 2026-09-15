@@ -1386,7 +1386,18 @@ def tilelang_sparse_fwd(
             block_I=block_I,
             threads=threads,
         )
-        out = kernel_combine(partial_o_batched, partial_lse_batched)
+        from sglang.kernels.ops.attention.dsa.split_kv_combine_hip import (
+            combine_or_fallback,
+        )
+
+        out = combine_or_fallback(
+            partial_o_batched,
+            partial_lse_batched,
+            num_heads,
+            d_v,
+            n_groups,
+            kernel_combine,
+        )
     else:
         kernel_factory = (
             sparse_attention_fwd_kernel_v1
