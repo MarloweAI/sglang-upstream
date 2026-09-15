@@ -269,6 +269,33 @@ class TopKConfig:
 # -------------------------------- TopKOutput ---------------------------------------
 
 
+_AITER_BYPASS_LOGGED: list = []
+
+
+def _aiter_fused_router_bypass(
+    topk_config: TopKConfig, hidden_dim: int, num_experts: int
+) -> bool:
+    """Whether the installed aiter can route this MoE itself, so top-k is skipped here.
+
+    Imported lazily: `moe_runner.aiter` imports this module, and the aiter package is
+    absent on non-ROCm builds.
+    """
+    try:
+        from sglang.srt.layers.moe.moe_runner.aiter import fused_router_can_bypass_topk
+    except ImportError:
+        return False
+    decision = fused_router_can_bypass_topk(topk_config, hidden_dim, num_experts)
+    if not _AITER_BYPASS_LOGGED:
+        _AITER_BYPASS_LOGGED.append(decision)
+        logger.info(
+            "aiter fused router: top-k bypass %s (hidden_dim=%d, experts=%d)",
+            "ENABLED" if decision else "not taken",
+            hidden_dim,
+            num_experts,
+        )
+    return decision
+
+
 class TopKOutputChecker:
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
@@ -656,6 +683,18 @@ class TopK(BaseFusedOp):
             get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
             output_format = TopKOutputFormat.BYPASSED
+        elif _aiter_fused_router_bypass(
+            self.topk_config, hidden_states.shape[-1], router_logits.shape[-1]
+        ):
+            # The aiter build carries a fused routing preamble that does the selection
+            # itself, so computing it here would be paid twice. The runner falls back
+            # via `to_standard()` if the per-call check refuses, which is why this gate
+            # only reads static configuration -- the answer must not differ between
+            # CUDA-graph capture and replay. In particular the validated token-count
+            # envelope is enforced in the runner, not here: `to_standard()` runs the
+            # same `select_experts` this branch would have run, so a refusal above the
+            # bound costs the ordinary path and nothing more.
+            output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
 
@@ -728,7 +767,6 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
         return fused_topk_npu(
@@ -1624,11 +1662,10 @@ def biased_grouped_topk_gpu(
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
     if (
-        _is_cuda
-        and num_expert_group
-        and num_expert_group > 1
-        and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
-    ):
+        (_is_cuda and num_expert_group and num_expert_group > 1)
+        # ROCm also admits single-group routing; CUDA's condition is unchanged.
+        or (_is_hip and num_expert_group)
+    ) and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
         # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
         # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
         # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
@@ -1636,18 +1673,26 @@ def biased_grouped_topk_gpu(
             moe_fused_gate as jit_grouped_gate,
         )
 
+        # The kernel wants the total width; select_experts passes a routed-only
+        # topk on the aiter path only (`num_routed_topk if _use_aiter else top_k`).
+        #
+        # True, not the caller's flag: an aiter runner skips the post-MoE multiply,
+        # so the routed weights must carry routed_scaling_factor and the shared
+        # slot must be 1.0. That flag describes the runner, not this kernel.
         return jit_grouped_gate(
-            gating_output.to(dtype=torch.float32),
+            gating_output,
             correction_bias.to(dtype=torch.float32),
-            topk,
+            topk + num_fused_shared_experts if _use_aiter else topk,
             scoring_func="sigmoid",
             num_fused_shared_experts=num_fused_shared_experts,
             renormalize=renormalize,
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0
             ),
-            apply_routed_scaling_factor_on_output=bool(
-                apply_routed_scaling_factor_on_output
+            apply_routed_scaling_factor_on_output=(
+                True
+                if (_use_aiter and num_fused_shared_experts > 0)
+                else bool(apply_routed_scaling_factor_on_output)
             ),
             num_expert_group=num_expert_group,
             topk_group=topk_group,
@@ -1757,9 +1802,20 @@ def biased_grouped_topk_gpu(
 
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        # Don't re-downcast an fp32 correction bias at the aiter boundary: an
+        # offset bias loses too many levels in bf16 and reorders top-k. Cast the
+        # gating logits up instead. Gated on the bias dtype rather than the
+        # architecture, so a bias that arrives as bf16 is byte-identical to
+        # before, as is the radix4 path above.
+        if correction_bias.dtype == torch.float32:
+            aiter_gating_output = gating_output.to(torch.float32)
+            aiter_bias = correction_bias
+        else:
+            aiter_gating_output = gating_output
+            aiter_bias = bias
         aiter_biased_grouped_topk(
-            gating_output,
-            bias,
+            aiter_gating_output,
+            aiter_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
@@ -2199,6 +2255,10 @@ def _post_process_topk_ids(
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
+        # That router emits the shared slots itself; appending again would write
+        # the shared id twice and evict a real routed expert.
+        _aiter_append = topk_ids.shape[-1] < topk_config.top_k
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
