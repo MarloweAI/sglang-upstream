@@ -1949,6 +1949,11 @@ class Envs:
     # epilogue, which a sampled step replays before the sampling-accept graph, so the
     # greedy accept and commits are not run (gated) beside the sampled ones.
     SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT = EnvBool(False)
+    # DSpark static decode on ROCm: one HIP graph a cycle (FutureMap resolve, draft prep,
+    # draft, verify prep, verify, accept and commits) for decode batches of at most
+    # SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS requests; other batches take the per-stage graphs.
+    SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH = EnvBool(False)
+    SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS = EnvInt(1)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

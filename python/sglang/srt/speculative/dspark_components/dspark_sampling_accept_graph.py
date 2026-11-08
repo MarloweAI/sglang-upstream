@@ -43,6 +43,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.model_executor.runner_utils.graph_splice import new_cuda_graph
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
@@ -275,7 +276,7 @@ class DsparkSamplingAcceptGraph:
     ) -> Optional[torch.cuda.CUDAGraph]:
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
-        graph = torch.cuda.CUDAGraph()
+        graph = new_cuda_graph()
         try:
             # graph_capture() enables pynccl, which the in-graph accept broadcast needs.
             with (
