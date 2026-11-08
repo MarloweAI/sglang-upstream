@@ -1373,16 +1373,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _sampled_runner(self):
         """The target's decode graph runner when it captured the sampled verify
-        variants (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT), else None."""
+        variants (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT), else None. Looked up each
+        step: a recapture replaces the runner, and the old one's flag reaches no replay."""
+        runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
+        if (
+            runner is None
+            or not getattr(runner, "sampled_verify_variant", False)
+            or self._sampling_accept_graph is None
+        ):
+            return None
         if self._sampled_verify_runner is None:
-            runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
-            if runner is None or not getattr(runner, "sampled_verify_variant", False):
-                return None
-            if self._sampling_accept_graph is None:
-                return None
-            self._sampled_verify_runner = runner
             logger.info("DSpark: sampled verify steps replay the epilogue-free variant.")
-        return self._sampled_verify_runner
+        self._sampled_verify_runner = runner
+        return runner
 
     def _sampling_graph_eligible(
         self,
