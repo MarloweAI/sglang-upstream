@@ -5,8 +5,9 @@ single-CTA ``speculative_sampling_classic_kernel``:
 
 1. per-vocab-block target / draft max and sum-exp (rows x 8,192-token blocks), no
    probability tensors;
-2. a one-warp accept per request that reads only those stats plus the draft token's
-   logits: accept iff ``log p(x) > log u + log q(x)``, i.e. ``u * q < p`` as before;
+2. the accept, which reads only those stats plus the draft token's logits: accept iff
+   ``log p(x) > log u + log q(x)``, i.e. ``u * q < p`` as before; every program of step 3
+   reruns it (a few loads), so it needs no launch of its own;
 3. a block-parallel Gumbel-max resample of the rejected row's residual
    ``max(p - q, 0)`` (or of ``p`` at the bonus row), reduced by a one-program insert.
 
@@ -192,11 +193,12 @@ def _stats_kernel(
 
 
 @triton.jit
-def _rejection_kernel(
+def _reject_resample_kernel(
     correct_len_ptr,
     raw_len_ptr,
     trim_ptr,
-    rej_lse_ptr,
+    res_max_ptr,
+    res_arg_ptr,
     candidates_ptr,
     candidates_stride,
     verify_lens_ptr,
@@ -213,16 +215,21 @@ def _rejection_kernel(
     draft_temp_ptr,
     target_vocab,
     draft_vocab,
-    bs,
     key,
     counter_ptr,
     STRIDE: tl.constexpr,
+    NUM_STAT_BLOCKS: tl.constexpr,
+    PADDED_STAT_BLOCKS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
-    PADDED_BLOCKS: tl.constexpr,
+    BLOCK: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     HAS_CUTOFF: tl.constexpr,
 ):
+    """The chain accept and the residual resample in one launch: every program of a
+    request reruns the request's accept from the stats (a few loads; the coins are
+    counter-based, so every program draws the same), block 0 stores the lengths."""
     req = tl.program_id(0).to(tl.int64)
+    block_idx = tl.program_id(1)
     seed = _step_seed(key, counter_ptr)
     t_temp = tl.load(target_temp_ptr + req).to(tl.float32)
     d_temp = 1.0
@@ -238,7 +245,9 @@ def _rejection_kernel(
             )
             valid = (token >= 0) & (token < target_vocab)
             token = tl.minimum(tl.maximum(token, 0), target_vocab - 1)
-            t_lse = _global_lse(t_max_ptr, t_sumexp_ptr, row, NUM_BLOCKS, PADDED_BLOCKS)
+            t_lse = _global_lse(
+                t_max_ptr, t_sumexp_ptr, row, NUM_STAT_BLOCKS, PADDED_STAT_BLOCKS
+            )
             log_p = (
                 tl.load(target_logits_ptr + row * target_stride + token).to(tl.float32)
                 / t_temp
@@ -247,7 +256,7 @@ def _rejection_kernel(
             log_q = 0.0
             if HAS_DRAFT_LOGITS:
                 d_lse = _global_lse(
-                    d_max_ptr, d_sumexp_ptr, row, NUM_BLOCKS, PADDED_BLOCKS
+                    d_max_ptr, d_sumexp_ptr, row, NUM_STAT_BLOCKS, PADDED_STAT_BLOCKS
                 )
                 log_q = (
                     tl.load(
@@ -266,62 +275,19 @@ def _rejection_kernel(
             ok = valid & (log_q > float("-inf")) & (log_p > tl.log(u) + log_q)
             verifying = ok
             accepted += ok.to(tl.int32)
-    tl.store(raw_len_ptr + req, accepted)
-    capped = accepted
-    if HAS_CUTOFF:
-        cap = tl.load(verify_lens_ptr + req).to(tl.int32) - 1
-        capped = tl.minimum(accepted, cap)
-    tl.store(correct_len_ptr + req, capped)
-    tl.store(trim_ptr + req, accepted - capped)
-    t_lse_rej = 0.0
-    d_lse_rej = 0.0
-    if accepted < STRIDE - 1:
-        rej_row = req * STRIDE + accepted
-        t_lse_rej = _global_lse(
-            t_max_ptr, t_sumexp_ptr, rej_row, NUM_BLOCKS, PADDED_BLOCKS
-        )
-        if HAS_DRAFT_LOGITS:
-            d_lse_rej = _global_lse(
-                d_max_ptr, d_sumexp_ptr, rej_row, NUM_BLOCKS, PADDED_BLOCKS
-            )
-    tl.store(rej_lse_ptr + req, t_lse_rej)
-    tl.store(rej_lse_ptr + bs + req, d_lse_rej)
-
-
-@triton.jit
-def _resample_kernel(
-    res_max_ptr,
-    res_arg_ptr,
-    raw_len_ptr,
-    rej_lse_ptr,
-    candidates_ptr,
-    candidates_stride,
-    target_logits_ptr,
-    target_stride,
-    draft_logits_ptr,
-    draft_stride_0,
-    draft_stride_1,
-    target_temp_ptr,
-    draft_temp_ptr,
-    target_vocab,
-    draft_vocab,
-    bs,
-    key,
-    counter_ptr,
-    STRIDE: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK: tl.constexpr,
-    HAS_DRAFT_LOGITS: tl.constexpr,
-):
-    req = tl.program_id(0).to(tl.int64)
-    block_idx = tl.program_id(1)
-    seed = _step_seed(key, counter_ptr)
-    r = tl.load(raw_len_ptr + req).to(tl.int64)
+    if block_idx == 0:
+        tl.store(raw_len_ptr + req, accepted)
+        capped = accepted
+        if HAS_CUTOFF:
+            cap = tl.load(verify_lens_ptr + req).to(tl.int32) - 1
+            capped = tl.minimum(accepted, cap)
+        tl.store(correct_len_ptr + req, capped)
+        tl.store(trim_ptr + req, accepted - capped)
+    r = accepted.to(tl.int64)
     row = req * STRIDE + r
     is_bonus = r == STRIDE - 1
     offs = block_idx * BLOCK + tl.arange(0, BLOCK)
     mask = offs < target_vocab
-    t_temp = tl.load(target_temp_ptr + req).to(tl.float32)
     t = (
         tl.load(
             target_logits_ptr + row * target_stride + offs,
@@ -335,13 +301,22 @@ def _resample_kernel(
     else:
         rejected = tl.load(candidates_ptr + req * candidates_stride + r + 1)
         if HAS_DRAFT_LOGITS:
-            d_temp = tl.load(draft_temp_ptr + req).to(tl.float32)
-            log_p = t - tl.load(rej_lse_ptr + req)
-            log_q = tl.load(
-                draft_logits_ptr + req * draft_stride_0 + r * draft_stride_1 + offs,
-                mask=offs < draft_vocab,
-                other=float("-inf"),
-            ).to(tl.float32) / d_temp - tl.load(rej_lse_ptr + bs + req)
+            t_lse_rej = _global_lse(
+                t_max_ptr, t_sumexp_ptr, row, NUM_STAT_BLOCKS, PADDED_STAT_BLOCKS
+            )
+            d_lse_rej = _global_lse(
+                d_max_ptr, d_sumexp_ptr, row, NUM_STAT_BLOCKS, PADDED_STAT_BLOCKS
+            )
+            log_p = t - t_lse_rej
+            log_q = (
+                tl.load(
+                    draft_logits_ptr + req * draft_stride_0 + r * draft_stride_1 + offs,
+                    mask=offs < draft_vocab,
+                    other=float("-inf"),
+                ).to(tl.float32)
+                / d_temp
+                - d_lse_rej
+            )
             # log max(p - q, 0) = log p + log1p(-q / p), -inf where q >= p.
             ratio = tl.exp(log_q - log_p)
             residual = tl.where(
@@ -433,7 +408,6 @@ def blockwise_rejection_triton(
         (4, bs * stride, num_blocks), dtype=torch.float32, device=device
     )
     lens = torch.empty((3, bs), dtype=torch.int32, device=device)
-    rej_lse = torch.empty((2, bs), dtype=torch.float32, device=device)
     res_blocks = triton.cdiv(target_vocab, _RESAMPLE_BLOCK)
     res_max = torch.empty((bs, res_blocks), dtype=torch.float32, device=device)
     res_arg = torch.empty((bs, res_blocks), dtype=torch.int64, device=device)
@@ -456,29 +430,18 @@ def blockwise_rejection_triton(
     verify_lens = (
         cutoff_verify_lens.to(device=device).contiguous() if has_cutoff else correct_len
     )
-    _rejection_kernel[(bs,)](
-        correct_len, raw_len, trim, rej_lse,
+    _reject_resample_kernel[(bs, res_blocks)](
+        correct_len, raw_len, trim, res_max, res_arg,
         candidates, candidates.stride(0), verify_lens,
         t_max, t_sumexp, d_max, d_sumexp,
         target_logits, target_logits.stride(0),
         d_ptr, d_s0, d_s1,
         target_temperatures, draft_temperatures,
-        target_vocab, draft_vocab, bs,
+        target_vocab, draft_vocab,
         noise.key, noise.counter,
-        STRIDE=stride, NUM_BLOCKS=num_blocks, PADDED_BLOCKS=padded_blocks,
+        STRIDE=stride, NUM_STAT_BLOCKS=num_blocks, PADDED_STAT_BLOCKS=padded_blocks,
+        NUM_BLOCKS=res_blocks, BLOCK=_RESAMPLE_BLOCK,
         HAS_DRAFT_LOGITS=has_draft, HAS_CUTOFF=has_cutoff,
-        num_warps=1,
-    )  # fmt: skip
-    _resample_kernel[(bs, res_blocks)](
-        res_max, res_arg, raw_len, rej_lse,
-        candidates, candidates.stride(0),
-        target_logits, target_logits.stride(0),
-        d_ptr, d_s0, d_s1,
-        target_temperatures, draft_temperatures,
-        target_vocab, draft_vocab, bs,
-        noise.key, noise.counter,
-        STRIDE=stride, NUM_BLOCKS=res_blocks, BLOCK=_RESAMPLE_BLOCK,
-        HAS_DRAFT_LOGITS=has_draft,
     )  # fmt: skip
     _insert_kernel[(bs,)](
         bonus, correct_len, raw_len, res_max, res_arg,
