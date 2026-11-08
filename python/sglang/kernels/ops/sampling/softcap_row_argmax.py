@@ -1,4 +1,4 @@
-"""Greedy token selection over softcapped logits of a vocab shard."""
+"""Greedy token selection over (softcapped) fp32 logits of a vocab shard."""
 
 import torch
 import triton
@@ -15,6 +15,7 @@ def _softcap_row_argmax_kernel(
     col_offset,
     softcapping_value,
     BLOCK_SIZE: tl.constexpr,
+    APPLY_SOFTCAP: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     best_val = -float("inf")
@@ -23,9 +24,11 @@ def _softcap_row_argmax_kernel(
         cols = start + tl.arange(0, BLOCK_SIZE)
         mask = cols < valid_width
         x = tl.load(logits_ptr + row * row_stride + cols, mask=mask, other=0.0)
-        x = x / softcapping_value
-        x = libdevice.tanh(x)
-        x = x * softcapping_value
+        x = x.to(tl.float32)
+        if APPLY_SOFTCAP:
+            x = x / softcapping_value
+            x = libdevice.tanh(x)
+            x = x * softcapping_value
         x = tl.where(mask, x, -float("inf"))
         block_val, block_idx = tl.max(
             x, axis=0, return_indices=True, return_indices_tie_break_left=True
@@ -38,9 +41,12 @@ def _softcap_row_argmax_kernel(
 
 
 def softcap_row_argmax(logits, final_logit_softcapping, valid_width, col_offset):
-    """Per row of a vocab shard: ``(max, first argmax + col_offset)`` of the
-    softcapped logits over the first ``valid_width`` columns, as fp32 ``[rows, 2]``."""
-    assert logits.dtype == torch.float32 and logits.stride(1) == 1
+    """Per row of a vocab shard: ``(max, first argmax + col_offset)`` of the fp32
+    logits (softcapped unless ``final_logit_softcapping`` is None) over the first
+    ``valid_width`` columns, as fp32 ``[rows, 2]``. bf16 or fp16 shards are widened to
+    fp32 first, as the cast to the fp32 logits buffer does."""
+    assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    assert logits.stride(1) == 1
     assert col_offset + logits.shape[1] < 2**24
     out = torch.empty(logits.shape[0], 2, dtype=torch.float32, device=logits.device)
     _softcap_row_argmax_kernel[(logits.shape[0],)](
@@ -49,8 +55,9 @@ def softcap_row_argmax(logits, final_logit_softcapping, valid_width, col_offset)
         logits.stride(0),
         valid_width,
         col_offset,
-        final_logit_softcapping,
+        final_logit_softcapping or 1.0,
         BLOCK_SIZE=4096,
+        APPLY_SOFTCAP=final_logit_softcapping is not None,
         num_warps=8,
     )
     return out
