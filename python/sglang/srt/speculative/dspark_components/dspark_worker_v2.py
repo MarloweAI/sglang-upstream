@@ -180,6 +180,10 @@ class DSparkWorkerV2(BaseSpecWorker):
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
+    # SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH: the cycle graph made this step's host draws.
+    _cycle_draws_done = False
+    # Whether the last decode step's accept and commits ran in a graph.
+    last_step_graph_accept = False
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -1105,7 +1109,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 and not sampling_info.need_min_p_sampling
             ):
                 sampling_info = None
-        if self._sim_draw_ahead:
+        if self._sim_draw_ahead and not self._cycle_draws_done:
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
             )
@@ -1185,7 +1189,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             and not batch.has_grammar
         )
-        if not self._sim_draw_ahead:
+        if not self._sim_draw_ahead and not self._cycle_draws_done:
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
                 self._verify_executor.verify_epilogue.begin_sim_bonus(
@@ -1284,7 +1288,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
         ):
-            if simulate_bonus_sampling_info is not None:
+            if simulate_bonus_sampling_info is not None and not self._cycle_draws_done:
                 epilogue.begin_sim_bonus(
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
@@ -1294,6 +1298,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
         graph_accept = folded_accept or region_accept is not None
+        self.last_step_graph_accept = graph_accept
         if region_accept is not None:
             epilogue.note_static_verify(bs)
             accept = region_accept
@@ -1427,6 +1432,95 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _cycle_sampling(self, batch: ScheduleBatch):
+        """(sampling_info, simulate_bonus_sampling_info) as ``_forward_decode`` derives
+        them for this batch."""
+        sampling_info = batch.sampling_info
+        if (
+            self._simulated_correct_len is None
+            or sampling_info is None
+            or sampling_info.is_all_greedy
+        ):
+            return sampling_info, None
+        simulate_bonus = sampling_info
+        if (
+            self._simulate_acc_greedy
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        ):
+            sampling_info = None
+        return sampling_info, simulate_bonus
+
+    def cycle_graph_eligible(self, batch: ScheduleBatch) -> bool:
+        """A decode step that one cycle graph (SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH)
+        reproduces: the static verify, the folded draft proposal and an accept in a
+        graph (the greedy fold, or the sampling-accept graph after the epilogue-free
+        verify variant with block-wise rejection), no grammar, logprobs or hidden
+        states. Decided from the batch alone."""
+        if not (
+            self._hosts_draft
+            and self._verify_epilogue is not None
+            and self._draft_sampler is not None
+            and self._verify_planner.mode_value == "static"
+            and get_parallel().pp_size == 1
+            and not get_parallel().attn_dp_enabled
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and not batch.return_hidden_states
+            and batch.sampling_info is not None
+            and verify_logits_adjustments_are_noop(batch.sampling_info)
+        ):
+            return False
+        sampling_info, simulate_bonus = self._cycle_sampling(batch)
+        if sampling_info is None or sampling_info.is_all_greedy:
+            return simulate_bonus is None or self._verify_epilogue.simulate_fold
+        return (
+            self._sampled_runner() is not None
+            and self._rejection_noise is not None
+            and self._sampling_graph_eligible(
+                batch=batch,
+                proposal_folded=True,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus,
+            )
+        )
+
+    def cycle_graph_greedy(self, batch: ScheduleBatch) -> bool:
+        """Whether a served step accepts in the verify graph's greedy fold (else in the
+        sampling-accept graph)."""
+        sampling_info, _ = self._cycle_sampling(batch)
+        return sampling_info is None or sampling_info.is_all_greedy
+
+    def begin_cycle_step(self, batch: ScheduleBatch) -> None:
+        """Before a cycle graph's capture or launch: this step's host draws of the
+        simulated acceptance and bonus seed, in ``_forward_decode``'s order, which then
+        skips them."""
+        bs = len(batch.reqs)
+        _, simulate_bonus = self._cycle_sampling(batch)
+        greedy = self.cycle_graph_greedy(batch)
+        epilogue = self._verify_epilogue
+        temperatures = (
+            None if simulate_bonus is None else simulate_bonus.temperatures[:bs]
+        )
+        if self._sim_draw_ahead:
+            self._begin_simulated_step_ahead(
+                bs=bs, simulate_bonus_sampling_info=simulate_bonus
+            )
+        else:
+            self._verify_executor.begin_simulated_step()
+            if greedy and epilogue.simulate_fold:
+                epilogue.begin_sim_bonus(bs, temperatures)
+        if not greedy and simulate_bonus is not None:
+            epilogue.begin_sim_bonus(bs, temperatures)
+        self._cycle_draws_done = True
+
+    def end_cycle_step(self) -> None:
+        self._cycle_draws_done = False
 
     def _sampled_runner(self):
         """The target's decode graph runner when it captured the sampled verify
