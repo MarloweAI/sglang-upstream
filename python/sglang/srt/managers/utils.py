@@ -24,6 +24,36 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
+
+def _async_d2h_together(*tensors):
+    """``_async_d2h`` of each tensor; device tensors that share one storage come back in a
+    single copy of the byte span covering them, viewed again on the host."""
+    live = [t for t in tensors if isinstance(t, torch.Tensor) and not t.is_cpu]
+    if len(live) < 2 or any(
+        t.untyped_storage().data_ptr() != live[0].untyped_storage().data_ptr()
+        or not t.is_contiguous()
+        for t in live
+    ):
+        return tuple(
+            _async_d2h(t) if isinstance(t, torch.Tensor) else t for t in tensors
+        )
+    base = live[0].untyped_storage().data_ptr()
+    lo = min(t.data_ptr() - base for t in live)
+    hi = max(t.data_ptr() - base + t.numel() * t.element_size() for t in live)
+    span = torch.empty(0, dtype=torch.uint8, device=live[0].device).set_(
+        live[0].untyped_storage(), lo, (hi - lo,)
+    )
+    host = _async_d2h(span)
+    out = []
+    for t in tensors:
+        if not isinstance(t, torch.Tensor) or t.is_cpu:
+            out.append(t)
+            continue
+        off = t.data_ptr() - base - lo
+        nbytes = t.numel() * t.element_size()
+        out.append(host[off : off + nbytes].view(t.dtype).view(t.shape))
+    return tuple(out)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import (
@@ -204,12 +234,16 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
-
-        if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
-
-        if self.block_accept_lens is not None:
+        # One copy for the step's result tensors that share a device storage (a static
+        # DSpark verify keeps out tokens and commit lengths in one), and none for a
+        # tensor that is another one (block accept lengths are the commit lengths there).
+        block_is_accept = self.block_accept_lens is self.accept_lens
+        self.next_token_ids, self.accept_lens = _async_d2h_together(
+            self.next_token_ids, self.accept_lens
+        )
+        if block_is_accept:
+            self.block_accept_lens = self.accept_lens
+        elif self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)
 
         if self.cap_lens is not None:
