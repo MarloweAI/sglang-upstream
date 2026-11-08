@@ -15,6 +15,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1090,6 +1091,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         slots, self._relay_slots = self._relay_slots, None
         if slots is None and anchor_ids is not None and self._slot_window:
             slots = self._window_slots(bs, relay=None)
+        prewritten = slots is not None and slots.verify_loc32 is not None
+        for model_runner in (self.model_runner, self.draft_model_runner):
+            if hasattr(model_runner.attn_backend, "mark_out_loc_prewritten"):
+                model_runner.attn_backend.mark_out_loc_prewritten(
+                    bs if prewritten else None
+                )
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -1488,7 +1495,36 @@ class DSparkWorkerV2(BaseSpecWorker):
             bufs[2].numel() // q, bufs[3].numel() // q, bufs[4].numel(),
         ) < bs:
             return None
-        return WindowSlots(*bufs, relay=relay)
+        loc32 = [
+            self._raw_out_loc_buffer(runner, model_runner, bs, width)
+            for runner, model_runner, width in (
+                (target, self.model_runner, w),
+                (draft, self.draft_model_runner, q),
+            )
+        ]
+        if any(b is None for b in loc32):
+            loc32 = [None, None]
+        return WindowSlots(
+            *bufs, relay=relay, verify_loc32=loc32[0], draft_loc32=loc32[1]
+        )
+
+    @staticmethod
+    def _raw_out_loc_buffer(runner, model_runner, bs: int, width: int):
+        """The captured raw metadata write locations of ``runner``'s graph for ``bs``
+        requests when the window's launch can write them: an unpadded graph, write
+        locations not translated, an attention backend that offers them."""
+        backend = model_runner.attn_backend
+        full = model_runner.runner_ids.space(IdSpaceKind.FULL)
+        if (
+            not hasattr(backend, "raw_out_loc_buffer")
+            or (full is not None and full.write is not None)
+            or runner._pad_to_bucket(bs, runner.capture_bs) != bs
+        ):
+            return None
+        loc = backend.raw_out_loc_buffer(bs)
+        if loc is None or loc.numel() != bs * width:
+            return None
+        return loc
 
     def relay_lengths_in_step(self, batch: ScheduleBatch, future_map) -> Optional[torch.Tensor]:
         """FutureMap hook (SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW): for a static decode
