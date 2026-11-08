@@ -65,6 +65,7 @@ class _Recording:
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
         self.result: Optional["GenerationBatchResult"] = None
         self.seq_lens: Optional[torch.Tensor] = None
+        self.rows: Optional[torch.Tensor] = None
         self.bonus: Optional[torch.Tensor] = None
         self.splice: dict = {}
         self.t0 = time.perf_counter()
@@ -83,7 +84,8 @@ class DsparkCycleGraph:
         self._capture_stream = torch.cuda.Stream()
         # The request rows every recording reads (FutureMap rows, req_to_token rows).
         self._rows = torch.zeros((self.max_bs,), dtype=torch.int64, device=device)
-        self._rows_of: Optional[torch.Tensor] = None  # whose rows _rows holds
+        self._rows_of: Optional[torch.Tensor] = None  # whose rows the rows buffer holds
+        self._rows_in: Optional[torch.Tensor] = None
         self._recordings: Dict[tuple, _Recording] = {}
         self._warm: Dict[tuple, int] = {}
         self._epoch = graphs_epoch()
@@ -139,12 +141,22 @@ class DsparkCycleGraph:
             return CycleRoute.PER_STAGE
         return CycleRoute.RECORD
 
-    def _bind_rows(self, batch: "ScheduleBatch") -> None:
-        """Point ``_rows`` at this batch's request rows (a copy when they changed)."""
-        if self._rows_of is not batch.req_pool_indices:
-            bs = len(batch.reqs)
-            self._rows[:bs].copy_(batch.req_pool_indices)
-            self._rows_of = batch.req_pool_indices
+    def _rows_buffer(self) -> torch.Tensor:
+        """The graph runners' shared req_pool_indices slot when there is one (their
+        fills then copy nothing), else this module's buffer."""
+        slot = self.worker._target_input_slot("req_pool_indices")
+        if slot is not None and slot.dtype == torch.int64 and slot.numel() >= self.max_bs:
+            return slot
+        return self._rows
+
+    def _bind_rows(self, batch: "ScheduleBatch") -> torch.Tensor:
+        """This batch's request rows in the rows buffer (a copy when they changed)."""
+        rows = self._rows_buffer()
+        bs = len(batch.reqs)
+        if self._rows_of is not batch.req_pool_indices or self._rows_in is not rows:
+            rows[:bs].copy_(batch.req_pool_indices)
+            self._rows_of, self._rows_in = batch.req_pool_indices, rows
+        return rows[:bs]
 
     # ---- recording -------------------------------------------------------------
 
@@ -152,14 +164,14 @@ class DsparkCycleGraph:
         """Start capturing the step's forward region on the capture stream, which is
         current until ``end_record``; the batch reads its rows from ``_rows`` meanwhile."""
         assert self._recording is None
-        bs = len(batch.reqs)
-        self._bind_rows(batch)
+        rows = self._bind_rows(batch)
         self.worker.begin_cycle_step(batch)
         rec = _Recording(graphs_epoch())
+        rec.rows = rows
         self._recording = rec
         self._batch_rows = batch.req_pool_indices
-        batch.req_pool_indices = self._rows[:bs]
-        batch.spec_info.future_indices = self._rows[:bs]
+        batch.req_pool_indices = rows
+        batch.spec_info.future_indices = rows
         self._stream_ctx = torch.cuda.stream(self._capture_stream)
         self._stream_ctx.__enter__()
         rec.graph.capture_begin(pool=self._pool, capture_error_mode="thread_local")
@@ -216,7 +228,8 @@ class DsparkCycleGraph:
 
     def replay(self, batch: "ScheduleBatch") -> "GenerationBatchResult":
         rec = self._recordings[self._key]
-        self._bind_rows(batch)
+        rows = self._bind_rows(batch)
+        assert rows.data_ptr() == rec.rows.data_ptr(), "the recording's rows buffer moved"
         self.worker.begin_cycle_step(batch)
         rec.graph.replay()
         self.worker.end_cycle_step()
