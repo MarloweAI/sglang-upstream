@@ -78,6 +78,25 @@ def capture_lora_variant(variant: Optional[str]):
         _capture_lora_variant = previous
 
 
+# The target verify graph variant being captured ("greedy" / "sampled"), or None.
+_capture_verify_variant: Optional[str] = None
+
+
+def get_capture_verify_variant() -> Optional[str]:
+    return _capture_verify_variant
+
+
+@contextmanager
+def capture_verify_variant(variant: Optional[str]):
+    global _capture_verify_variant
+    previous = _capture_verify_variant
+    _capture_verify_variant = variant
+    try:
+        yield
+    finally:
+        _capture_verify_variant = previous
+
+
 def get_capture_attention_variant() -> Optional[str]:
     return _capture_attention_variant
 

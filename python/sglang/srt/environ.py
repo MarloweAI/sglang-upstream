@@ -1945,6 +1945,10 @@ class Envs:
     # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
     # sampling accept and commits as a CUDA graph right after the verify graph.
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
+    # With it: each target verify graph size also captures a variant without the greedy
+    # epilogue, which a sampled step replays before the sampling-accept graph, so the
+    # greedy accept and commits are not run (gated) beside the sampled ones.
+    SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
