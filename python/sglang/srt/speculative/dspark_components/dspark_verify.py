@@ -596,8 +596,12 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_commit: Optional[DeferredContextCommit] = None,
         post_fold: bool = False,
+        random_seed: Optional[int] = None,
     ) -> None:
         self.max_bs = int(max_bs)
+        # The sampled sim bonus's per-step seed. Seeded from the server seed, one draw a
+        # step on every rank, so the ranks draw the same bonus without a broadcast.
+        self._sim_seed_rng = random.Random(random_seed) if random_seed is not None else random
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -728,7 +732,7 @@ class DsparkVerifyEpilogue:
             return
         self._sim_greedy_bs = None
         self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
-        self.sim_seed_buf.fill_(random.getrandbits(31))
+        self.sim_seed_buf.fill_(self._sim_seed_rng.getrandbits(31))
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
