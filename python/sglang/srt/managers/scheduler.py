@@ -334,6 +334,9 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dspark_components.dspark_cycle_graph import (
+    CycleRoute,
+)
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -1694,6 +1697,22 @@ class Scheduler(
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
         )
+
+        self._cycle_graph = None
+        if (
+            envs.SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH.get()
+            and _is_hip
+            and self.enable_overlap
+            and self.draft_worker is not None
+            and hasattr(self.draft_worker, "cycle_graph_eligible")
+        ):
+            from sglang.srt.speculative.dspark_components.dspark_cycle_graph import (
+                DsparkCycleGraph,
+            )
+
+            self._cycle_graph = DsparkCycleGraph(
+                worker=self.draft_worker, future_map=self.future_map, device=self.device
+            )
 
         self._confidence_budget_prepare = None
         if (
@@ -4733,7 +4752,10 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.enable_overlap:
+            cycle_route = self._cycle_graph_route(batch)
+            if cycle_route is CycleRoute.REPLAY:
+                batch_result = self._run_cycle_graph(batch)
+            elif self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 gpu_only_lens = (
@@ -4748,6 +4770,8 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if cycle_route is CycleRoute.RECORD:
+                        self._cycle_graph.begin_record(batch)
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -4811,7 +4835,9 @@ class Scheduler(
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
                             )
-                            if _is_hip:
+                            if cycle_route is CycleRoute.RECORD:
+                                pass  # copied once the recorded graph has run
+                            elif _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
                                 batch_result.copy_to_cpu(
@@ -4822,6 +4848,11 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
+                    if cycle_route is CycleRoute.RECORD:
+                        batch_result = self._cycle_graph.end_record(batch, batch_result)
+                        batch_result.copy_to_cpu(
+                            return_logprob=False, return_hidden_states=False
+                        )
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
@@ -5039,6 +5070,35 @@ class Scheduler(
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
             model_runner._pending_elastic_scale_update = None
+
+    def _cycle_graph_route(self, batch: ScheduleBatch) -> Optional[CycleRoute]:
+        """The cycle graph's path for this batch (SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH);
+        None when it doesn't serve it."""
+        if self._cycle_graph is None:
+            return None
+        if (
+            not self.enable_overlap
+            or batch.spec_algorithm.is_none()
+            or self._confidence_budget_prepare is not None
+            or getattr(self.future_map, "needs_cpu_seq_lens", True)
+        ):
+            return self._cycle_graph.route_none()
+        return self._cycle_graph.route(batch)
+
+    def _run_cycle_graph(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """A decode step served by one launch of its recorded cycle graph."""
+        with self.forward_stream_ctx:
+            self.forward_stream.wait_stream(self.schedule_stream)
+            batch_result = self._cycle_graph.replay(batch)
+            batch_result.copy_done = self.device_module.Event()
+            batch_result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+        batch.input_ids = None
+        batch.spec_info = batch_result.next_draft_input
+        batch.spec_info.future_dsa_topk_indices_available = (
+            batch.spec_info.dsa_topk_indices is not None
+        )
+        batch.spec_info.future_indices = batch.req_pool_indices
+        return batch_result
 
     def _relay_forward_payload(
         self,
