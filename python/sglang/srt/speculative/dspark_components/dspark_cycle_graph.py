@@ -20,7 +20,8 @@ copy and ``process_batch_result``.
 Which batches it serves is decided from the batch alone (``DSparkWorkerV2.
 cycle_graph_eligible`` and at most SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS requests): like the
 per-batch-size graphs, other batches take the per-stage path. One recording per batch
-size and accept kind (greedy or sampled), made after ``NUM_WARMUP`` per-stage steps of
+size, accept kind (greedy or sampled) and target attention variant (the candidate
+indexer's, chosen from host lengths as the per-stage path chooses it), made after ``NUM_WARMUP`` per-stage steps of
 that kind (they capture the lazily captured glue and accept graphs) and kept until a
 spliced graph is captured again. A served step right after any other step (another
 batch, a prefill) or of a new batch takes the per-stage path once: it restages what the
@@ -83,13 +84,13 @@ class DsparkCycleGraph:
         # The request rows every recording reads (FutureMap rows, req_to_token rows).
         self._rows = torch.zeros((self.max_bs,), dtype=torch.int64, device=device)
         self._rows_of: Optional[torch.Tensor] = None  # whose rows _rows holds
-        self._recordings: Dict[Tuple[int, bool], _Recording] = {}
-        self._warm: Dict[Tuple[int, bool], int] = {}
+        self._recordings: Dict[tuple, _Recording] = {}
+        self._warm: Dict[tuple, int] = {}
         self._epoch = graphs_epoch()
         # The previous step's batch, when it was a served step of the same batch.
         self._last: Optional[tuple] = None
         self._recording: Optional[_Recording] = None
-        self._key: Optional[Tuple[int, bool]] = None
+        self._key: Optional[tuple] = None
         self._batch_rows: Optional[torch.Tensor] = None
         self.num_recordings = 0
         self.num_replays = 0
@@ -121,7 +122,11 @@ class DsparkCycleGraph:
             self._pool = torch.cuda.graph_pool_handle()
             self._warm.clear()
             self._epoch = graphs_epoch()
-        key = (bs, self.worker.cycle_graph_greedy(batch))
+        key = (
+            bs,
+            self.worker.cycle_graph_greedy(batch),
+            self.worker.cycle_graph_variant(batch),
+        )
         identity = self._identity(batch)
         last, self._last = self._last, identity
         same = last is not None and all(x is y for x, y in zip(last, identity))
@@ -182,6 +187,11 @@ class DsparkCycleGraph:
             )
         if rec.epoch != graphs_epoch():
             raise RuntimeError("DSpark cycle graph: a graph was captured while recording")
+        if self.worker.last_verify_variant() != self._key[2]:
+            raise RuntimeError(
+                "DSpark cycle graph: the step replayed verify variant %r, predicted %r"
+                % (self.worker.last_verify_variant(), self._key[2])
+            )
         rec.result = self._snapshot(result)
         rec.seq_lens = batch.seq_lens
         rec.bonus = getattr(batch.spec_info, "bonus_tokens", None)
@@ -193,7 +203,7 @@ class DsparkCycleGraph:
         logger.info(
             "DSpark cycle graph recorded for %s: %d graphs spliced (%d nodes), nodes %s, "
             "capture %.1f ms, instantiate and launch %.1f ms.",
-            "bs %d %s" % (self._key[0], "greedy" if self._key[1] else "sampled"),
+            "bs %d %s %s" % (self._key[0], "greedy" if self._key[1] else "sampled", self._key[2]),
             rec.splice.get("graphs", 0),
             rec.splice.get("nodes", 0),
             nodes,

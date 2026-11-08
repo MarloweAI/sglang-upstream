@@ -81,6 +81,7 @@ from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph impor
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
+    candidate_request_length_bound,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     target_model_type,
@@ -1495,6 +1496,34 @@ class DSparkWorkerV2(BaseSpecWorker):
         sampling-accept graph)."""
         sampling_info, _ = self._cycle_sampling(batch)
         return sampling_info is None or sampling_info.is_all_greedy
+
+    def cycle_graph_variant(self, batch: ScheduleBatch) -> Optional[str]:
+        """The target verify graph's attention variant this step replays, from the same
+        host lengths the verify batch carries: the allocated lengths, or without them
+        the requests' length bound."""
+        runner = self.model_runner.decode_cuda_graph_runner
+        variants = getattr(runner, "attention_graph_variants", None)
+        if variants is None:
+            return None
+        bs = len(batch.reqs)
+        if not runner._attention_varies_at(runner._pad_to_bucket(bs, runner.capture_bs)):
+            return None
+        allocated = getattr(batch.spec_info, "nxt_kv_lens_cpu", None)
+        if (
+            not self._verify_executor._verify_backend_self_adds_seq_lens()
+            and allocated is not None
+        ):
+            longest = int(allocated[:bs].max())
+        else:
+            longest = candidate_request_length_bound(
+                batch.reqs, self.verify_num_draft_tokens
+            )
+        return variants.select_for_max_seq_len(longest)
+
+    def last_verify_variant(self) -> Optional[str]:
+        """The attention variant of the target verify graph key last replayed."""
+        key = getattr(self.model_runner.decode_cuda_graph_runner, "_replay_graph_key", None)
+        return getattr(key, "attention_variant", None)
 
     def begin_cycle_step(self, batch: ScheduleBatch) -> None:
         """Before a cycle graph's capture or launch: this step's host draws of the
