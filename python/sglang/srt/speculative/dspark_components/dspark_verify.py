@@ -640,15 +640,17 @@ class DsparkVerifyEpilogue:
         self.cap_trim_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
-        self.commit_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device=device
-        )
         self.new_seq_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
         )
-        self.out_tokens_buf = torch.zeros(
-            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        # Out tokens and commit lengths share one storage, so the step's result copy
+        # brings both back in one transfer (copy_to_cpu).
+        n_out = self.max_bs * self.stride * 8
+        results = torch.zeros(n_out + self.max_bs * 4, dtype=torch.uint8, device=device)
+        self.out_tokens_buf = (
+            results[:n_out].view(torch.int64).view(self.max_bs, self.stride)
         )
+        self.commit_lens_buf = results[n_out:].view(torch.int32)
         # Under the accept-site broadcast the fused tail serves only simulate_fold,
         # whose broadcast inputs (length, draw) the kernel can take.
         self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
