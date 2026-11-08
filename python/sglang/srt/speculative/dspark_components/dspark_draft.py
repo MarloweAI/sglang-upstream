@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.runner_utils.graph_splice import graphs_epoch
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -376,6 +377,11 @@ class DraftBlockProposer:
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        # SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW (set by the worker): the draft input ids
+        # live in the draft runner's input slot; (slot address, graphs epoch) it holds
+        # masks for.
+        self.use_runner_input_slot = False
+        self._draft_block_ids_slot_state: Optional[tuple] = None
         # (sampler, bs, temperatures, top_ks) last staged: SamplingBatchInfo rebinds
         # these tensors when the batch changes, never edits them in place
         self._staged_params_key: Optional[tuple] = None
@@ -542,7 +548,26 @@ class DraftBlockProposer:
             self.draft_model_runner.forward(idle_batch)
 
     def draft_block_ids_view(self, *, bs: int, device) -> torch.Tensor:
-        """The ``[bs, query_token_num]`` draft input ids: mask tokens past column 0."""
+        """The ``[bs, query_token_num]`` draft input ids: mask tokens past column 0.
+        In the draft graph runner's input_ids slot when it has one (its fill then
+        copies nothing); the mask columns are written again whenever a capture may
+        have overwritten the slot."""
+        q = self.query_token_num
+        runner = self.draft_model_runner.decode_cuda_graph_runner
+        registry = getattr(runner, "buffer_registry", None)
+        if (
+            self.use_runner_input_slot
+            and registry is not None
+            and registry.has_slot("input_ids")
+        ):
+            slot = registry.get_slot("input_ids").buffer
+            rows = slot.numel() // q
+            if bs <= rows and slot.device == torch.device(device):
+                state = (slot.data_ptr(), graphs_epoch())
+                if self._draft_block_ids_slot_state != state:
+                    slot[: rows * q].view(rows, q)[:, 1:].fill_(int(self._mask_token_id))
+                    self._draft_block_ids_slot_state = state
+                return slot[: bs * q].view(bs, q)
         buf = self._draft_block_ids_buf
         if buf is None or buf.shape[0] < bs or buf.device != torch.device(device):
             buf = torch.full(
@@ -576,8 +601,13 @@ class DraftBlockProposer:
         draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
         if not anchor_prepared:
             draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :query_token_num].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
+        if verify_window.draft_positions is not None:
+            # The window's launch wrote the draft runner's slots.
+            draft_positions = verify_window.draft_positions
+            draft_cache_loc = verify_window.draft_cache_loc
+        else:
+            draft_positions = positions_2d[:, :query_token_num].reshape(-1)
+            draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
         draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
             self.draft_model, "forward_embed"
@@ -621,6 +651,14 @@ class DraftBlockProposer:
             self.draft_model_runner.runner_ids,
             cols=slice(0, query_token_num),
         )
+        if (
+            verify_window.draft_cache_loc is not None
+            and not verify_window.iteration_ids.is_translated_for(
+                self.draft_model_runner.runner_ids
+            )
+        ):
+            # The same ids, already in the draft runner's write slot.
+            draft_forward_batch.out_cache_loc = draft_cache_loc
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         runs_graph = graph_runner is not None and graph_runner.can_run_graph(

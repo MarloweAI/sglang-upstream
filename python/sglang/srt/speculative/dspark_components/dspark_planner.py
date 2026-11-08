@@ -63,6 +63,25 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     # The iteration's plan of `verify_cache_loc`: the draft block, the verify
     # and the target-hidden KV writes all take their ids from it.
     iteration_ids: IterationIds
+    # The draft block's columns, packed ([batch * width]), when written to the draft
+    # runner's input slots (WindowSlots).
+    draft_positions: Optional[torch.Tensor] = None
+    draft_cache_loc: Optional[torch.Tensor] = None
+
+
+class WindowSlots(msgspec.Struct, frozen=True):
+    """The graph runners' input slots the verify window's launch writes, so their
+    fills have nothing to copy: the target verify runner's positions and write
+    locations, the draft runner's, and the shared per-request lengths. ``relay``:
+    the FutureMap buffers (new seq lens, bonus) indexed by request row, read in the
+    same launch instead of the FutureMap's gathers."""
+
+    verify_positions: torch.Tensor
+    verify_loc: torch.Tensor
+    draft_positions: torch.Tensor
+    draft_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    relay: Optional[tuple] = None
 
 
 class DSparkVerifyPlanner:
@@ -790,6 +809,8 @@ def alloc_verify_window(
     seq_lens_cpu: Optional[torch.Tensor],
     bonus: Optional[torch.Tensor] = None,
     anchor_ids: Optional[torch.Tensor] = None,
+    slots: Optional[WindowSlots] = None,
+    draft_width: int = 0,
 ) -> VerifyWindow:
     """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
     plan's read table. ``anchor_ids``, when given, gets ``bonus`` in column 0
@@ -797,7 +818,27 @@ def alloc_verify_window(
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = None
-    if anchor_ids is not None:
+    window_outputs = {}
+    draft_positions = draft_cache_loc = None
+    if slots is not None:
+        assert anchor_ids is not None
+        positions_2d = slots.verify_positions[: bs * verify_w].view(bs, verify_w)
+        draft_positions = slots.draft_positions[: bs * draft_width]
+        draft_cache_loc = slots.draft_loc[: bs * draft_width]
+        window_outputs = dict(
+            out=slots.verify_loc[: bs * verify_w],
+            draft_positions_out=draft_positions,
+            draft_loc_out=draft_cache_loc,
+        )
+        if slots.relay is not None:
+            # prefix_lens is slots.seq_lens[:bs]; this launch writes it.
+            window_outputs.update(
+                start_by_row=True,
+                start_src=slots.relay[0],
+                seq_lens_out=prefix_lens,
+            )
+            bonus = slots.relay[1]
+    elif anchor_ids is not None:
         positions_2d = torch.empty(
             (bs, verify_w), dtype=torch.int64, device=prefix_lens.device
         )
@@ -809,6 +850,7 @@ def alloc_verify_window(
         positions_out=positions_2d,
         anchor_src=bonus,
         anchor_out=anchor_ids,
+        **window_outputs,
     )
     if positions_2d is None:
         positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
@@ -818,6 +860,8 @@ def alloc_verify_window(
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
         iteration_ids=plan,
+        draft_positions=draft_positions,
+        draft_cache_loc=draft_cache_loc,
     )
 
 

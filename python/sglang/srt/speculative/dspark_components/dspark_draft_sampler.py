@@ -44,6 +44,7 @@ class DsparkDraftSampler:
         greedy_draft: bool,
         out=None,
         megakernel_sampler: Optional[Callable] = None,
+        verify_ids_out: Optional[torch.Tensor] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -63,9 +64,20 @@ class DsparkDraftSampler:
         # graph tail, so the step skips its eager concat (SGLANG_OPT_DSV41_DSPARK_MID_FOLD).
         self.verify_ids: Optional[torch.Tensor] = None
         if envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
-            self.verify_ids = torch.empty(
-                (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
-            )
+            width = self.max_bs * (self.gamma + 1)
+            if (
+                verify_ids_out is not None
+                and verify_ids_out.numel() >= width
+                and verify_ids_out.dtype == torch.int64
+            ):
+                # The target verify runner's input_ids slot: its fill copies nothing.
+                self.verify_ids = verify_ids_out[:width].view(
+                    self.max_bs, self.gamma + 1
+                )
+            else:
+                self.verify_ids = torch.empty(
+                    (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
+                )
         confidence_head = model.confidence_head
         if confidence_head is None:
             self.confidence_out = self.confidence_raw_out = None
@@ -213,6 +225,7 @@ def maybe_build_draft_sampler(
     greedy_draft: bool,
     tp_sync: SpecTpSync,
     out=None,
+    verify_ids_out: Optional[torch.Tensor] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -243,4 +256,5 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         out=out,
         megakernel_sampler=megakernel_sampler,
+        verify_ids_out=verify_ids_out,
     )

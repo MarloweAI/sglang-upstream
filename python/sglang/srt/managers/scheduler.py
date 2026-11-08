@@ -1698,6 +1698,15 @@ class Scheduler(
             needs_confidence_relay=needs_confidence_relay,
         )
 
+        if (
+            envs.SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW.get()
+            and self.draft_worker is not None
+            and hasattr(self.draft_worker, "relay_lengths_in_step")
+        ):
+            self.future_map.resolve_in_step = partial(
+                self.draft_worker.relay_lengths_in_step, future_map=self.future_map
+            )
+
         self._cycle_graph = None
         if (
             envs.SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH.get()

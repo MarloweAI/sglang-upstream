@@ -355,6 +355,10 @@ class FutureMap:
             pool=req_to_token_pool,
         )
         self._relay: Optional[FutureRelayBuffers] = None
+        # A spec worker that reads the relay buffers in its own step: batch ->
+        # the seq lens tensor that step fills, or None (then this map gathers).
+        self.resolve_in_step = None
+        self._resolved_in_step = None
         if (
             _offered_relay is not None
             and _offered_relay.new_seq_lens.shape[0] == self.req_pool_size
@@ -488,6 +492,10 @@ class FutureMap:
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
+        if self._resolved_in_step is batch:
+            self._resolved_in_step = None
+            draft_input.bonus_tokens = None
+            return
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
@@ -597,6 +605,17 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        self._resolved_in_step = None
+        if stream_ordered and not self.needs_cpu_seq_lens and self.resolve_in_step:
+            seq_lens = self.resolve_in_step(batch)
+            if seq_lens is not None:
+                # The worker's step gathers the seq lens and the bonus itself.
+                self._publish_fresh = False
+                self._resolved_in_step = batch
+                batch.seq_lens = seq_lens
+                batch.seq_lens_cpu = None
+                batch.seq_lens_sum = None
+                return
         if self.publish_ready is not None and stream_ordered:
             self._publish_fresh = False
         elif self.publish_ready is not None:
