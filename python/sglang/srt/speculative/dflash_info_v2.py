@@ -144,7 +144,8 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-        reserve = 2 * block_size
+        # Three verify blocks with the cycle ring (two cycles in flight ahead of the host).
+        reserve = (3 if envs.SGLANG_OPT_DSV41_DSPARK_CYCLE_RING.get() else 2) * block_size
         page_size = batch.token_to_kv_pool_allocator.page_size
 
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
