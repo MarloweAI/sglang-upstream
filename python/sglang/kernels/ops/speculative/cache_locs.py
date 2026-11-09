@@ -557,6 +557,13 @@ def assign_extend_cache_locs_uniform(
     DRAFT_WIDTH: tl.constexpr = 0,
     loc32_out=None,
     draft_loc32_out=None,
+    sim_correct_out=None,
+    sim_seed_out=None,
+    sim_counter=None,
+    sim_seed=0,
+    sim_acc_len=0.0,
+    SIM_METHOD: tl.constexpr = 0,
+    SIM_MAX: tl.constexpr = 1,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
@@ -566,7 +573,12 @@ def assign_extend_cache_locs_uniform(
     pool row, not by pid (relay buffers); ``seq_lens_out[pid]`` gets the start.
     ``draft_positions_out`` / ``draft_loc_out`` get the first DRAFT_WIDTH columns
     of the positions and write locations, packed per row; ``loc32_out`` /
-    ``draft_loc32_out`` the write locations (all columns / the draft's) as int32."""
+    ``draft_loc32_out`` the write locations (all columns / the draft's) as int32.
+    SIM_METHOD (1 match-expected, 2 multinomial): program 0 draws the step's simulated
+    correct length into ``sim_correct_out`` (acceptance length in [1, SIM_MAX], minus 1)
+    and a 31-bit bonus seed into ``sim_seed_out``, from Philox keyed by ``sim_seed`` and
+    the step counter ``sim_counter``, which it advances: the same on every rank, and the
+    same sequence on the per-stage and cycle-graph paths."""
     BLOCK_SIZE: tl.constexpr = 64
     pid = tl.program_id(axis=0)
     row = tl.load(req_pool_indices + pid)
@@ -576,6 +588,24 @@ def assign_extend_cache_locs_uniform(
         kv_start = tl.load(start_offset + pid)
     if seq_lens_out is not None:
         tl.store(seq_lens_out + pid, kv_start)
+    if SIM_METHOD > 0:
+        if pid == 0:
+            step = tl.load(sim_counter)
+            tl.store(sim_counter, step + 1)
+            key = (step * 2).to(tl.uint32)
+            if SIM_METHOD == 1:
+                acc = tl.minimum(tl.maximum(sim_acc_len, 1.0), SIM_MAX * 1.0)
+                lower = tl.floor(acc)
+                u = tl.rand(sim_seed, key)
+                acc_len = tl.where((lower < SIM_MAX) & (u < acc - lower), lower + 1.0, lower)
+            else:
+                x = tl.randn(sim_seed, key) + sim_acc_len
+                x = tl.minimum(tl.maximum(x, 1.0), SIM_MAX * 1.0)
+                acc_len = tl.floor(x + 0.5)
+            tl.store(sim_correct_out, (acc_len - 1.0).to(tl.int64))
+            if sim_seed_out is not None:
+                bits = tl.randint(sim_seed, key + 1)
+                tl.store(sim_seed_out, (bits & 0x7FFFFFFF).to(tl.int32))
     token_pool = req_to_token + row * pool_len
     out_cache_ptr = out_cache_loc + pid * draft_token_num
     if anchor_out is not None:
@@ -631,6 +661,37 @@ def assign_extend_cache_locs_uniform(
                 tl.store(swa_out + pid * draft_token_num + o, swa_loc, mask=mask)
 
 
+class SimDraw:
+    """The simulated acceptance the verify window's launch draws (SGLANG_SIMULATE_ACC_LEN):
+    ``correct_out`` ([1] int64) gets the correct length, ``seed_out`` ([1] int32, or
+    None) the sampled bonus seed; ``counter`` ([1] int64) is the step counter the draw
+    is keyed by."""
+
+    METHODS = {"match-expected": 1, "multinomial": 2}
+
+    def __init__(self, *, correct_out, seed_out, counter, seed: int, acc_len: float, method: str, max_len: int):
+        if method not in self.METHODS:
+            raise ValueError(f"device draw: unsupported SGLANG_SIMULATE_ACC_METHOD {method!r}")
+        self.correct_out = correct_out
+        self.seed_out = seed_out
+        self.counter = counter
+        self.seed = int(seed) & 0x7FFFFFFF
+        self.acc_len = float(acc_len)
+        self.method = self.METHODS[method]
+        self.max_len = int(max_len)
+
+    def kernel_args(self) -> dict:
+        return dict(
+            sim_correct_out=self.correct_out,
+            sim_seed_out=self.seed_out,
+            sim_counter=self.counter,
+            sim_seed=self.seed,
+            sim_acc_len=self.acc_len,
+            SIM_METHOD=self.method,
+            SIM_MAX=self.max_len,
+        )
+
+
 def assign_extend_cache_locs_uniform_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -654,6 +715,7 @@ def assign_extend_cache_locs_uniform_func(
     draft_loc_out: Optional[torch.Tensor] = None,
     loc32_out: Optional[torch.Tensor] = None,
     draft_loc32_out: Optional[torch.Tensor] = None,
+    sim_draw=None,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
@@ -669,6 +731,7 @@ def assign_extend_cache_locs_uniform_func(
     ``seq_lens_out`` gets each row's start. ``draft_positions_out`` /
     ``draft_loc_out`` ([batch, k] int64, contiguous) get the first k columns;
     ``loc32_out`` / ``draft_loc32_out`` (int32, contiguous) the same write locations.
+    ``sim_draw`` (``SimDraw``): the step's simulated acceptance drawn in the same launch.
     """
     if full_v2p is not None:
         assert full_out is not None and full_out.numel() == batch_size * draft_token_num
@@ -719,9 +782,11 @@ def assign_extend_cache_locs_uniform_func(
             DRAFT_WIDTH=draft_width,
             loc32_out=loc32_out,
             draft_loc32_out=draft_loc32_out,
+            **({} if sim_draw is None else sim_draw.kernel_args()),
         )
         return out_cache_loc
     assert not start_by_row and out is None and draft_loc_out is None and loc32_out is None
+    assert sim_draw is None, "the device draw requires a Triton device"
 
     # NPU / CPU platforms: fall back to the end_offset-tensor path.
     assert full_v2p is None, "fused write translation requires a Triton device"

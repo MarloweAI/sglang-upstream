@@ -748,16 +748,36 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
 
-    def begin_sim_bonus(self, bs: int, temperatures: Optional[torch.Tensor]) -> None:
-        """The step's bonus temperatures (None: greedy) and seed, before replay."""
+    _sim_temps_of = None
+
+    def begin_sim_bonus(
+        self,
+        bs: int,
+        temperatures: Optional[torch.Tensor],
+        *,
+        seed_on_device: bool = False,
+        owner=None,
+    ) -> None:
+        """The step's bonus temperatures (None: greedy) and seed, before replay.
+        ``seed_on_device``: the verify window's launch draws the seed
+        (SGLANG_OPT_DSV41_DSPARK_CYCLE_RING), and the temperatures are copied once per
+        ``owner`` (the batch's sampling info)."""
         if temperatures is None:
+            self._sim_temps_of = None
             if self._sim_greedy_bs != bs:
                 self.sim_temperatures_buf.zero_()
                 self._sim_greedy_bs = bs
             return
         self._sim_greedy_bs = None
-        self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
-        self.sim_seed_buf.fill_(self._sim_seed_rng.getrandbits(31))
+        if not seed_on_device:
+            self._sim_temps_of = None
+            self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
+            self.sim_seed_buf.fill_(self._sim_seed_rng.getrandbits(31))
+            return
+        held = self._sim_temps_of
+        if held is None or held[0] is not owner or held[1] != bs:
+            self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
+            self._sim_temps_of = (owner, bs)
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size

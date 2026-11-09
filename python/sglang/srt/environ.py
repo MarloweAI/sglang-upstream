@@ -1958,6 +1958,11 @@ class Envs:
     # nothing; the draft sampler writes the verify ids into the verify runner's slot.
     SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW = EnvBool(False)
     SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS = EnvInt(1)
+    # With the cycle graph and the slot window: the verify window's launch draws the
+    # simulated acceptance on device (keyed by a device step counter), and a
+    # replayed cycle returns its result through one host-enqueued copy into a pinned
+    # ring the host polls (no result or publish event a cycle).
+    SGLANG_OPT_DSV41_DSPARK_CYCLE_RING = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
