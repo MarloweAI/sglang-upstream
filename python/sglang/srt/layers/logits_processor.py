@@ -497,6 +497,8 @@ class LogitsProcessor(nn.Module):
         # only (capture_verify_variant), whatever the head's output dtype: their
         # logits are this rank's vocab shard, as the head wrote it.
         self.defer_greedy_verify_gather = False
+        # The same for the "sampled" variant, when the sampling accept reads the shard.
+        self.defer_sampled_verify_gather = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1128,9 +1130,14 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> bool:
         return (
-            self.defer_greedy_verify_gather
-            and logits_metadata.forward_mode.is_target_verify()
-            and get_capture_verify_variant() == "greedy"
+            logits_metadata.forward_mode.is_target_verify()
+            and (
+                (self.defer_greedy_verify_gather and get_capture_verify_variant() == "greedy")
+                or (
+                    self.defer_sampled_verify_gather
+                    and get_capture_verify_variant() == "sampled"
+                )
+            )
             and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
             and self._can_gather_tp_shards(
                 logits, local_hidden_states, lm_head, logits_metadata
@@ -1139,7 +1146,11 @@ class LogitsProcessor(nn.Module):
 
     def is_deferred_shard(self, logits: Optional[torch.Tensor]) -> bool:
         return (
-            (self.defer_verify_gather or self.defer_greedy_verify_gather)
+            (
+                self.defer_verify_gather
+                or self.defer_greedy_verify_gather
+                or self.defer_sampled_verify_gather
+            )
             and logits is not None
             and logits.shape[-1] < self.vocab_size
         )
