@@ -471,6 +471,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
                 random_seed=self.target_worker.random_seed,
+                compact_verify=self._verify_planner.is_compact_mode,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,

@@ -617,6 +617,7 @@ class DsparkVerifyEpilogue:
         deferred_commit: Optional[DeferredContextCommit] = None,
         post_fold: bool = False,
         random_seed: Optional[int] = None,
+        compact_verify: bool = True,
     ) -> None:
         self.max_bs = int(max_bs)
         # The sampled sim bonus's per-step seed. Seeded from the server seed, one draw a
@@ -686,9 +687,11 @@ class DsparkVerifyEpilogue:
         self.gated_commit_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
+        # Only a compact verify reads them: a static step's block accept lengths are
+        # its commit lengths (no cap trims).
         self.block_accept_lens_buf = (
             torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
-            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get() and compact_verify
             else None
         )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
