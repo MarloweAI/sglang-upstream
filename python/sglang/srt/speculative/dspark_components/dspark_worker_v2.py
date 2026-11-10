@@ -1381,6 +1381,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logits_output.next_token_logits = shard.finish_deferred_gather(
                     logits_output.next_token_logits
                 )
+            if (
+                not folded_accept
+                and sampling_info is not None
+                and not sampling_info.is_all_greedy
+                and draft_block.corrected_logits is not None
+                and self._draft_sampler is not None
+                and draft_block.corrected_logits.data_ptr()
+                == self._draft_sampler.step_logits.data_ptr()
+            ):
+                # The eager accept reads the folded draft's whole step logits.
+                self._draft_sampler.whole_step_logits(bs)
             accept = self._verify_executor.accept_and_finalize(
                 folded_accept=folded_accept,
                 bs=bs,
