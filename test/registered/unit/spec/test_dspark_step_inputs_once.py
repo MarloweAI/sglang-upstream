@@ -203,7 +203,9 @@ class TestPostFoldRelay(unittest.TestCase):
         )
         # A warmup scatter builds and offers the relay; the FutureMap adopts it
         # (which resets it to -1 in CI) before any live step scatters.
-        epi._scatter_future_relay(torch.tensor([0, 0, 0, 0]), 4)
+        epi._scatter_future_relay(
+            torch.tensor([0, 0, 0, 0]), epi._future_relay_rows(4)
+        )
         relay = epi.future_relay
         self.assertIs(overlap_utils._offered_relay, relay)
 
@@ -216,7 +218,9 @@ class TestPostFoldRelay(unittest.TestCase):
         epi.new_seq_lens_buf.copy_(torch.tensor([50, 60, 7, 7]))
         epi.bonus_buf.copy_(torch.tensor([500, 600, 9, 9]))
         # Two live rows; the padded rows index the dummy slot 0.
-        epi._scatter_future_relay(torch.tensor([3, 7, 0, 0]), 4)
+        epi._scatter_future_relay(
+            torch.tensor([3, 7, 0, 0]), epi._future_relay_rows(4)
+        )
         self.assertEqual(fm.new_seq_lens_buf[[3, 7]].tolist(), [50, 60])
         self.assertEqual(fm.output_tokens_buf[[3, 7]].tolist(), [500, 600])
 
