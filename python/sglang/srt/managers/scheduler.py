@@ -5099,8 +5099,11 @@ class Scheduler(
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.schedule_stream)
             batch_result = self._cycle_graph.replay(batch)
-            batch_result.copy_done = self.device_module.Event()
-            batch_result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+            if batch_result.copy_done is None:  # else the cycle ring copied it
+                batch_result.copy_done = self.device_module.Event()
+                batch_result.copy_to_cpu(
+                    return_logprob=False, return_hidden_states=False
+                )
         batch.input_ids = None
         batch.spec_info = batch_result.next_draft_input
         batch.spec_info.future_dsa_topk_indices_available = (
