@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Callable, Optional
 
@@ -105,6 +106,7 @@ class DsparkDraftSampler:
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
         self._megakernel_steps = None
+        self._megakernel_writes_verify_ids = False
         if megakernel_sampler is not None:
             self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
 
@@ -117,6 +119,13 @@ class DsparkDraftSampler:
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             )
+        extra = {}
+        if (
+            self.verify_ids is not None
+            and "verify_ids" in inspect.signature(megakernel_sampler).parameters
+        ):
+            # the megakernel's step writes the verify ids too: the tail's concat goes
+            extra["verify_ids"] = self.verify_ids
         steps = megakernel_sampler(
             gamma=self.gamma,
             max_bs=self.max_bs,
@@ -125,6 +134,10 @@ class DsparkDraftSampler:
             draft_tokens=self.out,
             step_logits=self.step_logits,
             step_temperatures=self.params.step_temperatures,
+            **extra,
+        )
+        self._megakernel_writes_verify_ids = bool(
+            getattr(steps, "writes_verify_ids", False)
         )
         # A rank on SGLang's block would wait in its per-step token sync (this group),
         # which the megakernel's step skips.
@@ -182,7 +195,9 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
-        if self.verify_ids is not None:
+        if self.verify_ids is not None and not (
+            step is not None and self._megakernel_writes_verify_ids
+        ):
             torch.cat(
                 [anchor.view(bs, 1), self.out[: bs * self.gamma].view(bs, self.gamma)],
                 dim=1,
