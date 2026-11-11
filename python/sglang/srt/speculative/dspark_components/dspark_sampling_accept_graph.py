@@ -106,7 +106,7 @@ def sampling_accept_commit_lens(
     draft_block = DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=(
-            None if draft_sampler.greedy_draft else draft_sampler.step_logits[:bs]
+            None if draft_sampler.greedy_draft else draft_sampler.whole_step_logits(bs)
         ),
         greedy_mask=params.greedy_mask[:bs],
         temperatures=params.temperatures[:bs],

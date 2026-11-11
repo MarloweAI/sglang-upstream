@@ -147,6 +147,16 @@ class DsparkDraftSampler:
         )
         return steps
 
+    def whole_step_logits(self, bs: int) -> Optional[torch.Tensor]:
+        """The step logits' whole rows of the last block, ``[:bs]``: a megakernel step that
+        keeps only its rank's columns (``gathers_step_logits``) gathers them here."""
+        if self.step_logits is None:
+            return None
+        steps = self._megakernel_steps
+        if steps is not None and steps(bs) is not None and hasattr(steps, "gather_step_logits"):
+            steps.gather_step_logits(bs)
+        return self.step_logits[:bs]
+
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
