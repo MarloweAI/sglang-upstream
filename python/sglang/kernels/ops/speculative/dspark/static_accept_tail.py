@@ -8,7 +8,8 @@ the simulated correct length override (build_accept_outs), commit / new seq lens
 a zero cap trim (FinalizeAcceptLens), the output tokens (BuildOutTokens), and the
 gated commit lengths the static epilogue's draft-KV commit reads. Every output equals
 the separate ops' bit for bit. With a simulated length and a supplied bonus the argmax ids
-are not read (``target_predict`` may be None).
+are not read (``target_predict`` may be None). ``correct_len_in`` (a sampled accept's
+per-row lengths, with ``bonus_in``) replaces the greedy match length.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ def _static_accept_tail_kernel(
     gate_ptr,
     sim_ptr,
     bonus_in_ptr,
+    correct_in_ptr,
     part_val_ptr,
     part_idx_ptr,
     correct_out_ptr,
@@ -51,6 +53,7 @@ def _static_accept_tail_kernel(
     NSPLIT: tl.constexpr,
     HAS_SIM: tl.constexpr,
     HAS_BONUS_IN: tl.constexpr,
+    HAS_CORRECT_IN: tl.constexpr,
     HAS_PARTS: tl.constexpr,
     NEED_TARGET: tl.constexpr,
     HAS_GATED: tl.constexpr,
@@ -69,6 +72,8 @@ def _static_accept_tail_kernel(
         num_correct = tl.min(tl.where(eq, BLOCK_T, offs), 0)
     if HAS_SIM:
         correct = tl.load(sim_ptr).to(tl.int32)
+    elif HAS_CORRECT_IN:
+        correct = tl.load(correct_in_ptr + row).to(tl.int32)
     else:
         correct = num_correct.to(tl.int32)
     if HAS_PARTS:
@@ -115,12 +120,13 @@ def static_accept_tail(
     bonus_in: Optional[torch.Tensor] = None,
     bonus_parts: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
     gated_commit_lens_out: Optional[torch.Tensor] = None,
+    correct_len_in: Optional[torch.Tensor] = None,
 ) -> None:
     """``candidates`` [bs, T] (anchor + drafts), ``target_predict`` [bs * T] argmax ids,
     ``bonus_parts`` (part_val [bs, NSPLIT], part_idx, vocab); outputs go to rows [:bs]."""
     assert bonus_in is None or bonus_parts is None
     assert target_predict is not None or (
-        simulated_correct_len is not None
+        (simulated_correct_len is not None or correct_len_in is not None)
         and (bonus_in is not None or bonus_parts is not None)
     )
     fn = (
@@ -144,6 +150,7 @@ def static_accept_tail(
         bonus_in=bonus_in,
         bonus_parts=bonus_parts,
         gated_commit_lens_out=gated_commit_lens_out,
+        correct_len_in=correct_len_in,
     )
 
 
@@ -167,6 +174,7 @@ def _static_accept_tail_triton(**kw) -> None:
         kw["gate"],
         sim if sim is not None else dummy,
         bonus_in if bonus_in is not None else dummy,
+        kw["correct_len_in"] if kw["correct_len_in"] is not None else dummy,
         parts[0] if parts is not None else dummy,
         parts[1] if parts is not None else dummy,
         kw["correct_len_out"],
@@ -184,9 +192,11 @@ def _static_accept_tail_triton(**kw) -> None:
         NSPLIT=parts[0].shape[1] if parts is not None else 1,
         HAS_SIM=sim is not None,
         HAS_BONUS_IN=bonus_in is not None,
+        HAS_CORRECT_IN=kw["correct_len_in"] is not None,
         HAS_PARTS=parts is not None,
         # The argmax ids only decide a length or bonus nothing else supplies.
-        NEED_TARGET=sim is None or (bonus_in is None and parts is None),
+        NEED_TARGET=(sim is None and kw["correct_len_in"] is None)
+        or (bonus_in is None and parts is None),
         HAS_GATED=gated is not None,
         num_warps=4,
     )
@@ -209,6 +219,7 @@ def static_accept_tail_torch(
     bonus_in: Optional[torch.Tensor] = None,
     bonus_parts: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
     gated_commit_lens_out: Optional[torch.Tensor] = None,
+    correct_len_in: Optional[torch.Tensor] = None,
 ) -> None:
     """Reference: the same outputs from per-row torch ops (CPU or GPU)."""
     bs, T = candidates.shape
@@ -220,6 +231,8 @@ def static_accept_tail_torch(
     rows = torch.arange(bs, device=candidates.device)
     if simulated_correct_len is not None:
         correct = simulated_correct_len.repeat(bs).to(torch.int32)
+    elif correct_len_in is not None:
+        correct = correct_len_in[:bs].to(torch.int32)
     else:
         correct = num_correct
     if bonus_parts is not None:

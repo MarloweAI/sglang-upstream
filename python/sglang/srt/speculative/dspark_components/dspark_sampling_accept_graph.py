@@ -38,6 +38,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
+from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_partials_graph,
+)
+from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -106,6 +110,42 @@ def sampling_accept_commit_lens(
         block_verification=block_verification,
         rejection_noise=rejection_noise,
     )
+    if epilogue._serves_accept_tail(bs) and not block_verification:
+        # The bookkeeping in the static fold's one launch: the sampled accept's lengths
+        # and bonus (or, simulated, the simulated length and the in-graph bonus draw).
+        # A static verify has no cutoff, so the cap trims are zero.
+        bonus_parts = correct_in = bonus_in = None
+        if simulated:
+            bonus_parts = (
+                *simulated_bonus_partials_graph(
+                    **epilogue._sim_bonus_args(io.logits, bs)
+                ),
+                io.logits.shape[1],
+            )
+        else:
+            correct_in, bonus_in = correct_len, bonus
+        static_accept_tail(
+            candidates=io.candidates,
+            target_predict=None,
+            seq_lens=io.seq_lens,
+            verify_lens=verify_lens,
+            gate=gate,
+            correct_len_out=epilogue.correct_len_buf,
+            bonus_out=epilogue.bonus_buf,
+            cap_trim_lens_out=epilogue.cap_trim_lens_buf,
+            commit_lens_out=epilogue.commit_lens_buf,
+            new_seq_lens_out=epilogue.new_seq_lens_buf,
+            out_tokens_out=epilogue.out_tokens_buf,
+            simulated_correct_len=epilogue.simulated_correct_len,
+            bonus_in=bonus_in,
+            bonus_parts=bonus_parts,
+            correct_len_in=correct_in,
+            gated_commit_lens_out=epilogue.gated_commit_lens_buf if gated else None,
+        )
+        block = epilogue.read_block_accept_lens(bs)
+        if block is not None:
+            block.copy_(epilogue.commit_lens_buf[:bs])
+        return epilogue.gated_commit_lens_buf[:bs] if gated else None
     bonus_logits = io.logits
     if simulated:
         bonus = epilogue.sim_bonus(io.logits, bs).to(bonus.dtype).view_as(bonus)
