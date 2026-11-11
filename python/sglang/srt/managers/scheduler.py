@@ -5095,9 +5095,12 @@ class Scheduler(
         return self._cycle_graph.route(batch)
 
     def _run_cycle_graph(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        """A decode step served by one launch of its recorded cycle graph."""
+        """A decode step served by one launch of its recorded cycle graph. The graph reads
+        nothing the scheduler stream writes for a replayed batch except new KV slots, so
+        it waits for that stream only on steps that allocated them."""
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.schedule_stream)
+            if batch.spec_info.prepare_allocated:
+                self.forward_stream.wait_stream(self.schedule_stream)
             batch_result = self._cycle_graph.replay(batch)
             if batch_result.copy_done is None:  # else the cycle ring copied it
                 batch_result.copy_done = self.device_module.Event()

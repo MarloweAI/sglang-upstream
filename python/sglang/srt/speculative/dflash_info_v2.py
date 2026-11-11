@@ -51,6 +51,8 @@ class DFlashDraftInputV2(SpecInput):
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    # The last prepare_for_decode wrote new KV slots into req_to_token.
+    prepare_allocated: bool = False
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
@@ -212,6 +214,7 @@ class DFlashDraftInputV2(SpecInput):
             # plan-stream context, so forward work cannot observe partially
             # prepared req_to_token / KV allocation state.
             caller_stream.wait_stream(plan_stream)
+        self.prepare_allocated = num_needed_tokens > 0
         for req in batch.reqs:
             req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.
