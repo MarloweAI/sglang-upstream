@@ -90,10 +90,13 @@ def sampling_accept_commit_lens(
         temperatures=params.temperatures[:bs],
         greedy_draft=draft_sampler.greedy_draft,
     )
+    simulated = epilogue.simulated_correct_len is not None
     correct_len, bonus, cap_trim_lens = accept_draft_tokens(
         candidates=io.candidates,
         target_logits=io.logits,
         draft_block=draft_block,
+        # The real sampling accept runs under simulated acceptance too, so a simulated
+        # step costs what a real one does; its outcome is then overwritten below.
         # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
         sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
         draft_input=None,
@@ -104,7 +107,7 @@ def sampling_accept_commit_lens(
         rejection_noise=rejection_noise,
     )
     bonus_logits = io.logits
-    if epilogue.simulated_correct_len is not None:
+    if simulated:
         bonus = epilogue.sim_bonus(io.logits, bs).to(bonus.dtype).view_as(bonus)
         bonus_logits = None
     commit_lens = build_accept_outs(
@@ -116,7 +119,14 @@ def sampling_accept_commit_lens(
         gamma=stride - 1,
         verify_num_draft_tokens=stride,
         tp_sync=tp_sync,
-        sync_site=SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
+        # Block-wise rejection's draws are counter-based and alike on every rank (as is
+        # the simulated length and bonus seed), so its outcome needs no accept broadcast
+        # beyond the graph accept's; the torch-RNG classic accept keeps the sample site.
+        sync_site=(
+            SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
+            if rejection_noise is not None
+            else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+        ),
         simulated_correct_len=epilogue.simulated_correct_len,
         target_logits=bonus_logits,
         out=epilogue.read_accept(bs),

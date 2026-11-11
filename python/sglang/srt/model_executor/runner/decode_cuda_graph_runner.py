@@ -103,6 +103,7 @@ from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
     capture_lora_variant,
+    capture_verify_variant,
     get_capture_attention_variant,
     model_capture_mode,
 )
@@ -374,6 +375,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+        # SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT: a "greedy" (with the capture tail
+        # hooks' greedy epilogue) and a "sampled" (without it) graph per verify size;
+        # the speculative worker sets verify_sampled_next before each verify replay.
+        self.sampled_verify_variant = (
+            envs.SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT.get()
+            and envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not self.model_runner.is_draft_worker
+        )
+        self.verify_sampled_next = False
 
         self.dllm_attention = self.attn_backend.dllm_attention
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
@@ -786,6 +797,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
+            if self.sampled_verify_variant:
+                return "sampled" if self.verify_sampled_next else "greedy"
             return None
         if forward_batch.lora_ids is not None and any(
             uid is not None for uid in forward_batch.lora_ids
@@ -1360,6 +1373,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else reversed(self.capture_bs)
         )
         lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
+        if self.sampled_verify_variant and not self.record_nolora_graph:
+            lora_variants = ("greedy", "sampled")
         for bs in capture_range:
             attention_variants = (
                 self.attention_graph_variants.capture_labels
@@ -1377,7 +1392,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
             for variant_label in lora_variants:
-                with capture_lora_variant(variant_label):
+                verify_variant = (
+                    variant_label if variant_label in ("greedy", "sampled") else None
+                )
+                with (
+                    capture_lora_variant(None if verify_variant else variant_label),
+                    capture_verify_variant(verify_variant),
+                ):
                     for attention_variant in attention_variants:
                         _set_capture_attention_variant(attention_variant)
                         self._set_profile_trace_tag(

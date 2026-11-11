@@ -43,6 +43,9 @@ from sglang.srt.managers.overlap_utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_verify_variant,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -750,6 +753,10 @@ class DsparkVerifyEpilogue:
         )
         if capturing:
             self.static_io[bs] = io
+        # The "sampled" verify variant (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT) leaves
+        # the accept and commits to the sampling-accept graph replayed after it.
+        if get_capture_verify_variant() == "sampled":
+            return
         committed_engram = self.run_static(
             io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
         )

@@ -160,6 +160,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
     _sampling_accept_graph = None
+    _sampled_verify_runner = None
     _rejection_noise = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
@@ -383,7 +384,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # so no accept broadcast is needed.
         self._rejection_noise = (
             make_rejection_noise(self.target_worker.random_seed, self.device)
-            if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
+            if is_cuda_alike() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
             else None
         )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
@@ -455,12 +456,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported
-                and is_cuda()
+                and is_cuda_alike()
             ):
                 self._sampling_accept_graph = DsparkSamplingAcceptGraph(
                     epilogue=self._verify_epilogue,
                     resolve_draft_sampler=lambda: self._draft_sampler,
-                    tp_sync=self._tp_sync,
+                    # The epilogue's: the graph accept site as the static fold sees it.
+                    tp_sync=self._verify_epilogue._tp_sync,
                     fused_argmax=target_is_dsv41,
                     block_verification=get_spec().speculative_use_block_verification,
                     device=self.device,
@@ -1152,6 +1154,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 )
         prepare_mamba_track_for_verify(batch)
+        # SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT: a step the sampling-accept graph serves
+        # replays the verify variant without the greedy epilogue.
+        sampled_runner = self._sampled_runner()
+        sampled_variant = (
+            sampled_runner is not None
+            and not fold_eligible
+            and not run_compact
+            and self._sampling_graph_eligible(
+                batch=batch,
+                proposal_folded=proposal.folded,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        )
+        if sampled_runner is not None:
+            sampled_runner.verify_sampled_next = sampled_variant
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1205,6 +1223,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             not folded_accept
             and can_run_cuda_graph
             and not run_compact
+            and (sampled_runner is None or sampled_variant)
             and self._sampling_graph_eligible(
                 batch=batch,
                 proposal_folded=proposal.folded,
@@ -1351,6 +1370,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _sampled_runner(self):
+        """The target's decode graph runner when it captured the sampled verify
+        variants (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT), else None."""
+        if self._sampled_verify_runner is None:
+            runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
+            if runner is None or not getattr(runner, "sampled_verify_variant", False):
+                return None
+            if self._sampling_accept_graph is None:
+                return None
+            self._sampled_verify_runner = runner
+            logger.info("DSpark: sampled verify steps replay the epilogue-free variant.")
+        return self._sampled_verify_runner
 
     def _sampling_graph_eligible(
         self,
