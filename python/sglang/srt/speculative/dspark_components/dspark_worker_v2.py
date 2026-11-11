@@ -1725,7 +1725,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_executor.begin_simulated_step()
             if greedy and epilogue.simulate_fold:
                 epilogue.begin_sim_bonus(bs, temperatures)
-        if not greedy and simulate_bonus is not None:
+        if not greedy and simulate_bonus is not None and not device_draw:
             epilogue.begin_sim_bonus(bs, temperatures)
         self._cycle_draws_done = True
 
