@@ -85,6 +85,23 @@ def sampling_accept_commit_lens(
     returns the gated commit lengths when ``gated``."""
     bs, stride = io.candidates.shape
     params = draft_sampler.params
+    if epilogue.verify_shard(io.logits) is not None:
+        # The "sampled" variant kept this rank's vocab shard (sampled_accept_on_shard).
+        gated_commit_lens = epilogue._static_sampled_tail(
+            candidates=io.candidates,
+            logits=io.logits,
+            draft_logits=draft_sampler.step_logits,
+            temperatures=params.temperatures[:bs],
+            rejection_noise=rejection_noise,
+            seq_lens=io.seq_lens,
+            verify_lens=verify_lens,
+            gate=gate,
+            gated=gated,
+        )
+        block = epilogue.read_block_accept_lens(bs)
+        if block is not None:
+            block.copy_(epilogue.commit_lens_buf[:bs])
+        return gated_commit_lens
     draft_tokens = io.candidates[:, 1:]
     draft_block = DraftBlockResult(
         draft_tokens=draft_tokens,
@@ -223,13 +240,11 @@ class DsparkSamplingAcceptGraph:
         ):
             return None
         epilogue = self._epilogue
-        graph_bs = min((b for b in epilogue.static_io if b >= bs), default=None)
-        if graph_bs is None:
+        # The replayed verify graph's buffers, as its capture recorded them.
+        io = epilogue.static_io_of_logits.get(target_logits.data_ptr())
+        if io is None or io.candidates.shape[0] < bs:
             return None
-        io = epilogue.static_io[graph_bs]
-        # The replayed verify graph must be the one whose buffers were recorded.
-        if target_logits.data_ptr() != io.logits.data_ptr():
-            return None
+        graph_bs = io.candidates.shape[0]
         key = (
             graph_bs,
             io.logits.data_ptr(),

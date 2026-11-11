@@ -589,6 +589,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             return None
         processors[0].defer_greedy_verify_gather = True
+        # The sampling-accept region's accept on the shard (block-wise draws alike on
+        # every rank, no accept broadcast).
+        processors[0].defer_sampled_verify_gather = (
+            epilogue.sampled_accept_on_shard
+            and self._sampling_accept_graph is not None
+            and self._rejection_noise is not None
+            and not epilogue._tail_broadcasts
+        )
         return processors[0]
 
     def _resolve_target_embed_tokens(self, target_model):
@@ -1308,6 +1316,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                             or sampling_info.sampling_mask_batch_indices is None
                         )
                     ),
+                    keep_sampled_shard=sampled_variant and not batch.return_logprob,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1362,6 +1371,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             epilogue.note_static_verify(bs)
             accept = region_accept
         else:
+            shard = (
+                None
+                if epilogue is None or logits_output.next_token_logits is None
+                else epilogue.verify_shard(logits_output.next_token_logits)
+            )
+            if shard is not None:
+                # A kept sampled-variant shard the region did not take: the whole logits.
+                logits_output.next_token_logits = shard.finish_deferred_gather(
+                    logits_output.next_token_logits
+                )
             accept = self._verify_executor.accept_and_finalize(
                 folded_accept=folded_accept,
                 bs=bs,

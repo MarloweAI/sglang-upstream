@@ -313,10 +313,13 @@ class TargetVerifyExecutor:
         verify_window: VerifyWindow,
         sampling_info,
         keep_verify_shard: bool = False,
+        keep_sampled_shard: bool = False,
     ) -> TargetVerifyResult:
         """``keep_verify_shard``: the graph's folded accept is the step's only reader
         of the logits, so a "greedy" variant graph's vocab shard stays as it is
-        (``next_token_logits`` None); otherwise the whole logits are gathered here."""
+        (``next_token_logits`` None); ``keep_sampled_shard``: the sampling-accept region
+        reads a "sampled" variant graph's shard (``next_token_logits`` the shard);
+        otherwise the whole logits are gathered here."""
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
@@ -353,6 +356,8 @@ class TargetVerifyExecutor:
             if self.verify_epilogue is not None
             else None
         )
+        if shard is not None and keep_sampled_shard:
+            return result
         if shard is not None:
             logits_output.next_token_logits = (
                 None
@@ -600,6 +605,11 @@ class StaticVerifyIO(msgspec.Struct, frozen=True):
 
 
 class DsparkVerifyEpilogue:
+    # Set by a kernel plugin whose _static_sampled_tail runs the temperature-sampled accept
+    # on the verify's vocab shard: the "sampled" verify variant then keeps the shard and the
+    # sampling-accept region takes that accept.
+    sampled_accept_on_shard = False
+
     def __init__(
         self,
         *,
@@ -703,6 +713,9 @@ class DsparkVerifyEpilogue:
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+        # The same per captured graph, by its logits' address: a batch size's graphs may
+        # each hold their own logits (a vocab shard), which a replay returns.
+        self.static_io_of_logits: dict[int, StaticVerifyIO] = {}
         # The target's LogitsProcessor when its "greedy" verify variant graphs keep
         # the rank's vocab shard (defer_greedy_verify_gather), else None.
         self.target_logits_processor = None
@@ -799,6 +812,7 @@ class DsparkVerifyEpilogue:
         # The region replays after the "sampled" variant: never a vocab shard.
         if capturing and get_capture_verify_variant() != "greedy":
             self.static_io[bs] = io
+            self.static_io_of_logits[io.logits.data_ptr()] = io
         # The "sampled" verify variant (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT) leaves
         # the accept and commits to the sampling-accept graph replayed after it.
         if get_capture_verify_variant() == "sampled":
@@ -886,6 +900,26 @@ class DsparkVerifyEpilogue:
             if gated
             else None
         )
+
+    def _static_sampled_tail(
+        self,
+        *,
+        candidates,
+        logits,
+        draft_logits,
+        temperatures,
+        rejection_noise,
+        seq_lens,
+        verify_lens,
+        gate,
+        gated: bool,
+    ) -> Optional[torch.Tensor]:
+        """The block-wise rejection accept (and under SGLANG_SIMULATE_ACC_LEN the simulated
+        length and bonus) of an all-sampled static step from this rank's vocab shard of the
+        verify's ``logits`` and the draft's whole ``draft_logits`` rows, into the accept
+        buffers; returns the gated commit lengths when ``gated``. A kernel plugin's
+        (``sampled_accept_on_shard``)."""
+        raise NotImplementedError("the sampled accept on a vocab shard is a kernel plugin's")
 
     def engram_history(self) -> Optional[torch.Tensor]:
         """The engram history the static epilogue commits into, or None."""
