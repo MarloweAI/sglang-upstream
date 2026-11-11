@@ -39,6 +39,8 @@ from typing import Any, Dict, List
 
 import torch
 
+from sglang.srt.model_executor.runner_utils.graph_splice import new_cuda_graph
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,7 +114,7 @@ class MetadataGlueGraph:
 
         if self._capture_stream is None:
             self._capture_stream = torch.cuda.Stream()
-        graph = torch.cuda.CUDAGraph()
+        graph = new_cuda_graph()
         try:
             # captured while serving: other threads may use CUDA meanwhile
             with torch.cuda.graph(
