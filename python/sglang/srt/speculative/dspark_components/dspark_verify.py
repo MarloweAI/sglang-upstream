@@ -33,6 +33,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
+    simulated_bonus_shard_keys,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
@@ -311,7 +312,11 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        keep_verify_shard: bool = False,
     ) -> TargetVerifyResult:
+        """``keep_verify_shard``: the graph's folded accept is the step's only reader
+        of the logits, so a "greedy" variant graph's vocab shard stays as it is
+        (``next_token_logits`` None); otherwise the whole logits are gathered here."""
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
@@ -342,8 +347,20 @@ class TargetVerifyExecutor:
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
+        logits_output = result.logits_output
+        shard = (
+            self.verify_epilogue.verify_shard(logits_output.next_token_logits)
+            if self.verify_epilogue is not None
+            else None
+        )
+        if shard is not None:
+            logits_output.next_token_logits = (
+                None
+                if keep_verify_shard
+                else shard.finish_deferred_gather(logits_output.next_token_logits)
+            )
 
-        if sampling_info is not None:
+        if sampling_info is not None and logits_output.next_token_logits is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -683,6 +700,9 @@ class DsparkVerifyEpilogue:
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+        # The target's LogitsProcessor when its "greedy" verify variant graphs keep
+        # the rank's vocab shard (defer_greedy_verify_gather), else None.
+        self.target_logits_processor = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -753,7 +773,8 @@ class DsparkVerifyEpilogue:
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        if capturing:
+        # The region replays after the "sampled" variant: never a vocab shard.
+        if capturing and get_capture_verify_variant() != "greedy":
             self.static_io[bs] = io
         # The "sampled" verify variant (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT) leaves
         # the accept and commits to the sampling-accept graph replayed after it.
@@ -859,7 +880,19 @@ class DsparkVerifyEpilogue:
         simulate_fold the argmax is skipped and the bonus select runs in the tail."""
         bs = candidates.shape[0]
         target_predict = bonus_in = bonus_parts = None
-        if not self.simulate_fold:
+        shard = self.verify_shard(logits)
+        if shard is not None:
+            # The rank's vocab shard: the ranks' row keys, never the whole logits.
+            if self.simulate_fold:
+                bonus_in = shard.deferred_select(self._sim_bonus_shard_keys(logits, bs))
+            else:
+                target_predict = shard.deferred_argmax(logits).view(-1)
+            if self._tail_broadcasts:
+                self._tp_sync.sync(
+                    SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, self.simulated_correct_len
+                )
+                self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus_in)
+        elif not self.simulate_fold:
             target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
         elif self._tail_broadcasts:
             bonus_in = self.sim_bonus(logits, bs)
@@ -873,7 +906,9 @@ class DsparkVerifyEpilogue:
                 *simulated_bonus_partials_graph(**self._sim_bonus_args(logits, bs)),
                 logits.shape[1],
             )
-        self._log_accept_tail(bs, bonus_in=bonus_in)
+        self._log_accept_tail(
+            bs, bonus_in=bonus_in if self._tail_broadcasts else None, shard=shard
+        )
         static_accept_tail(
             candidates=candidates,
             target_predict=target_predict,
@@ -904,11 +939,33 @@ class DsparkVerifyEpilogue:
             rows_per_request=self.stride,
         )
 
+    def verify_shard(self, logits):
+        """The target's LogitsProcessor when ``logits`` is its rank's vocab shard."""
+        lp = self.target_logits_processor
+        return lp if lp is not None and lp.is_deferred_shard(logits) else None
+
+    def _sim_bonus_shard_keys(self, logits, bs: int) -> torch.Tensor:
+        col_offset, valid_width = self.target_logits_processor.deferred_shard_offset(
+            logits
+        )
+        args = self._sim_bonus_args(logits, bs)
+        return simulated_bonus_shard_keys(
+            target_logits=logits,
+            col_offset=col_offset,
+            valid_width=valid_width,
+            vocab=self.target_logits_processor.vocab_size,
+            correct_len=args["correct_len"],
+            temperatures=args["temperatures"],
+            seed=args["seed"],
+            bs=bs,
+            rows_per_request=self.stride,
+        )
+
     def sim_bonus(self, logits, bs: int) -> torch.Tensor:
         """The simulated row's bonus from the buffers begin_sim_bonus staged; graph-safe."""
         return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
 
-    def _log_accept_tail(self, bs: int, *, bonus_in) -> None:
+    def _log_accept_tail(self, bs: int, *, bonus_in, shard=None) -> None:
         """Once per captured batch size, from the branch that launches the kernel."""
         if (
             bs in self._accept_tail_logged
@@ -918,10 +975,12 @@ class DsparkVerifyEpilogue:
             return
         self._accept_tail_logged.add(bs)
         logger.info(
-            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s)",
+            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s, "
+            "logits=%s)",
             bs,
             "sim-fold" if self.simulate_fold else "argmax",
             "inputs" if bonus_in is not None else "off",
+            "vocab shard" if shard is not None else "gathered",
         )
 
     def note_static_verify(self, bs: int) -> None:
