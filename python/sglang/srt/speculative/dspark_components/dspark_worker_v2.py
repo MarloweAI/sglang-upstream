@@ -1360,7 +1360,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
             block_accept_lens=self._block_accept_lens(
-                accept=accept, folded_accept=graph_accept, bs=bs
+                accept=accept,
+                folded_accept=graph_accept,
+                bs=bs,
+                static=not run_compact
+                and self._verify_planner.mode_value == "static",
             ),
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
@@ -1448,7 +1452,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "Simulated acceptance drawn ahead of the draft launch (first step)."
             )
 
-    def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
+    def _block_accept_lens(
+        self, *, accept, folded_accept: bool, bs: int, static: bool = False
+    ):
+        # A static verify has no cutoff, so no cap trims: the block accept lengths are the
+        # commit lengths themselves (no add, and copy_to_cpu brings them back once).
+        if static:
+            return accept.commit_lens
         in_graph = (
             self._verify_epilogue.read_block_accept_lens(bs)
             if folded_accept and self._verify_epilogue is not None
