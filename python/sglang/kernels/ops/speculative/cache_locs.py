@@ -555,6 +555,8 @@ def assign_extend_cache_locs_uniform(
     draft_positions_out=None,
     draft_loc_out=None,
     DRAFT_WIDTH: tl.constexpr = 0,
+    loc32_out=None,
+    draft_loc32_out=None,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
@@ -563,7 +565,8 @@ def assign_extend_cache_locs_uniform(
     START_BY_ROW: ``start_offset`` and ``anchor_src`` are indexed by the request's
     pool row, not by pid (relay buffers); ``seq_lens_out[pid]`` gets the start.
     ``draft_positions_out`` / ``draft_loc_out`` get the first DRAFT_WIDTH columns
-    of the positions and write locations, packed per row."""
+    of the positions and write locations, packed per row; ``loc32_out`` /
+    ``draft_loc32_out`` the write locations (all columns / the draft's) as int32."""
     BLOCK_SIZE: tl.constexpr = 64
     pid = tl.program_id(axis=0)
     row = tl.load(req_pool_indices + pid)
@@ -589,6 +592,8 @@ def assign_extend_cache_locs_uniform(
         mask = o < draft_token_num
         data = tl.load(token_pool + kv_start + o, mask=mask)
         tl.store(out_cache_ptr + o, data, mask=mask)
+        if loc32_out is not None:
+            tl.store(loc32_out + pid * draft_token_num + o, data.to(tl.int32), mask=mask)
         if positions_out is not None:
             tl.store(
                 positions_out + pid * draft_token_num + o,
@@ -598,6 +603,12 @@ def assign_extend_cache_locs_uniform(
         if DRAFT_WIDTH > 0:
             dmask = o < DRAFT_WIDTH
             tl.store(draft_loc_out + pid * DRAFT_WIDTH + o, data, mask=dmask)
+            if draft_loc32_out is not None:
+                tl.store(
+                    draft_loc32_out + pid * DRAFT_WIDTH + o,
+                    data.to(tl.int32),
+                    mask=dmask,
+                )
             tl.store(
                 draft_positions_out + pid * DRAFT_WIDTH + o,
                 kv_start.to(tl.int64) + o,
@@ -641,6 +652,8 @@ def assign_extend_cache_locs_uniform_func(
     seq_lens_out: Optional[torch.Tensor] = None,
     draft_positions_out: Optional[torch.Tensor] = None,
     draft_loc_out: Optional[torch.Tensor] = None,
+    loc32_out: Optional[torch.Tensor] = None,
+    draft_loc32_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
@@ -654,7 +667,8 @@ def assign_extend_cache_locs_uniform_func(
     ``out``: the int64 output to write (else a new tensor). ``start_by_row``:
     ``start_offset`` and ``anchor_src`` are per pool row (relay buffers) and
     ``seq_lens_out`` gets each row's start. ``draft_positions_out`` /
-    ``draft_loc_out`` ([batch, k] int64, contiguous) get the first k columns.
+    ``draft_loc_out`` ([batch, k] int64, contiguous) get the first k columns;
+    ``loc32_out`` / ``draft_loc32_out`` (int32, contiguous) the same write locations.
     """
     if full_v2p is not None:
         assert full_out is not None and full_out.numel() == batch_size * draft_token_num
@@ -703,9 +717,11 @@ def assign_extend_cache_locs_uniform_func(
             draft_positions_out=draft_positions_out,
             draft_loc_out=draft_loc_out,
             DRAFT_WIDTH=draft_width,
+            loc32_out=loc32_out,
+            draft_loc32_out=draft_loc32_out,
         )
         return out_cache_loc
-    assert not start_by_row and out is None and draft_loc_out is None
+    assert not start_by_row and out is None and draft_loc_out is None and loc32_out is None
 
     # NPU / CPU platforms: fall back to the end_offset-tensor path.
     assert full_v2p is None, "fused write translation requires a Triton device"

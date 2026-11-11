@@ -82,6 +82,10 @@ class WindowSlots(msgspec.Struct, frozen=True):
     draft_loc: torch.Tensor
     seq_lens: torch.Tensor
     relay: Optional[tuple] = None
+    # The int32 write locations of the verify / draft graphs' captured raw metadata
+    # ([bs * width] views), written in the same launch so the replay prep copies none.
+    verify_loc32: Optional[torch.Tensor] = None
+    draft_loc32: Optional[torch.Tensor] = None
 
 
 class DSparkVerifyPlanner:
@@ -829,6 +833,8 @@ def alloc_verify_window(
             out=slots.verify_loc[: bs * verify_w],
             draft_positions_out=draft_positions,
             draft_loc_out=draft_cache_loc,
+            loc32_out=slots.verify_loc32,
+            draft_loc32_out=slots.draft_loc32,
         )
         if slots.relay is not None:
             # prefix_lens is slots.seq_lens[:bs]; this launch writes it.
