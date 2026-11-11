@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -86,6 +87,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     target_uses_fused_argmax,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
@@ -106,6 +108,16 @@ from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _debug_observers_read_verify_logits() -> bool:
+    """A DSpark step observer reading the verify logits after a folded accept."""
+    return bool(
+        envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+        or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
+        or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get() > 0
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +481,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     rejection_noise=self._rejection_noise,
                 )
 
+        if self._verify_epilogue is not None:
+            self._verify_epilogue.target_logits_processor = (
+                self._defer_greedy_verify_gather()
+            )
+
         self._simulate_acc_greedy = (
             self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
         )
@@ -518,6 +535,32 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _defer_greedy_verify_gather(self) -> Optional[LogitsProcessor]:
+        """The target's LogitsProcessor, its "greedy" verify variant graphs set to
+        keep the rank's vocab shard, when the static epilogue's one-launch accept tail
+        reads those graphs' logits at every batch size and the steps it does not fold
+        gather them (run_non_compact); else None. The same on every rank."""
+        epilogue = self._verify_epilogue
+        low, high = epilogue._accept_tail_bs
+        max_bs = epilogue.max_bs
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if (
+            len(processors) != 1
+            or not epilogue._fused_accept_tail
+            or low > 1
+            or (high != 0 and high < max_bs)
+            or self._verify_planner.mode_value != "static"
+            or ragged_verify_compact_enabled()
+            or _debug_observers_read_verify_logits()
+        ):
+            return None
+        processors[0].defer_greedy_verify_gather = True
+        return processors[0]
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -1195,6 +1238,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    # Nothing after a folded static accept reads the logits.
+                    keep_verify_shard=(
+                        fold_eligible
+                        and self._verify_planner.mode_value == "static"
+                        and not batch.return_logprob
+                        and (
+                            sampling_info is None
+                            or sampling_info.sampling_mask_batch_indices is None
+                        )
+                    ),
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
