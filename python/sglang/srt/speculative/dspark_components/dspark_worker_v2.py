@@ -71,6 +71,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
     InfoSegment,
 )
+from sglang.kernels.ops.speculative.cache_locs import SimDraw
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
     WindowSlots,
@@ -96,6 +97,7 @@ from sglang.srt.speculative.spec_sampling_mask import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_METHOD,
     GrammarTree,
     build_grammar_vocab_mask,
     draft_pp_context,
@@ -388,6 +390,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._simulate_acc_len > 0
             else None
         )
+        # SGLANG_OPT_DSV41_DSPARK_CYCLE_RING: the verify window's launch draws the
+        # simulated acceptance and bonus seed (static slot-window steps, keyed by a
+        # device step counter); set up once
+        # the verify executor exists (_sim_draw).
+        self._device_draws = (
+            envs.SGLANG_OPT_DSV41_DSPARK_CYCLE_RING.get()
+            and self._slot_window
+            and self._simulated_correct_len is not None
+        )
+        self._sim_draw = None
+        self.last_step_device_draw = False
         # The simulated acceptance draw (and sim bonus seed) before the draft launch,
         # where the host waits on the previous verify anyway; off with real acceptance.
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
@@ -1092,6 +1105,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if slots is None and anchor_ids is not None and self._slot_window:
             slots = self._window_slots(bs, relay=None)
         prewritten = slots is not None and slots.verify_loc32 is not None
+        # The window's launch draws this step's simulated acceptance.
+        device_draw = self._device_draws and slots is not None
         for model_runner in (self.model_runner, self.draft_model_runner):
             if hasattr(model_runner.attn_backend, "mark_out_loc_prewritten"):
                 model_runner.attn_backend.mark_out_loc_prewritten(
@@ -1114,7 +1129,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             anchor_ids=anchor_ids,
             slots=slots,
             draft_width=self._proposer.query_token_num,
+            sim_draw=self._device_sim_draw() if device_draw else None,
         )
+        self.last_step_device_draw = device_draw
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
             self._verify_inputs_ready.record()
@@ -1139,7 +1156,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 and not sampling_info.need_min_p_sampling
             ):
                 sampling_info = None
-        if self._sim_draw_ahead and not self._cycle_draws_done:
+        if device_draw and not self._cycle_draws_done:
+            self._begin_device_drawn_step(
+                bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
+            )
+        elif self._sim_draw_ahead and not self._cycle_draws_done:
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
             )
@@ -1219,7 +1240,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             and not batch.has_grammar
         )
-        if not self._sim_draw_ahead and not self._cycle_draws_done:
+        if (
+            not self._sim_draw_ahead
+            and not self._cycle_draws_done
+            and not device_draw
+        ):
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
                 self._verify_executor.verify_epilogue.begin_sim_bonus(
@@ -1320,7 +1345,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             if simulate_bonus_sampling_info is not None and not self._cycle_draws_done:
                 epilogue.begin_sim_bonus(
-                    bs, simulate_bonus_sampling_info.temperatures[:bs]
+                    bs,
+                    simulate_bonus_sampling_info.temperatures[:bs],
+                    seed_on_device=device_draw,
+                    owner=simulate_bonus_sampling_info,
                 )
             region_accept = self._sampling_accept_graph.run(
                 bs=bs, target_logits=logits_output.next_token_logits
@@ -1641,10 +1669,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         key = getattr(self.model_runner.decode_cuda_graph_runner, "_replay_graph_key", None)
         return getattr(key, "attention_variant", None)
 
-    def begin_cycle_step(self, batch: ScheduleBatch) -> None:
+    def begin_cycle_step(self, batch: ScheduleBatch, device_draw: bool = False) -> None:
         """Before a cycle graph's capture or launch: this step's host draws of the
         simulated acceptance and bonus seed, in ``_forward_decode``'s order, which then
-        skips them."""
+        skips them. ``device_draw``: the recording's window launch draws them; only the
+        bonus temperatures are staged."""
         bs = len(batch.reqs)
         _, simulate_bonus = self._cycle_sampling(batch)
         greedy = self.cycle_graph_greedy(batch)
@@ -1652,7 +1681,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         temperatures = (
             None if simulate_bonus is None else simulate_bonus.temperatures[:bs]
         )
-        if self._sim_draw_ahead:
+        if device_draw:
+            if epilogue.simulate_fold or (not greedy and simulate_bonus is not None):
+                epilogue.begin_sim_bonus(
+                    bs, temperatures, seed_on_device=True, owner=simulate_bonus
+                )
+        elif self._sim_draw_ahead:
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus
             )
@@ -1660,7 +1694,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_executor.begin_simulated_step()
             if greedy and epilogue.simulate_fold:
                 epilogue.begin_sim_bonus(bs, temperatures)
-        if not greedy and simulate_bonus is not None:
+        if not greedy and simulate_bonus is not None and not device_draw:
             epilogue.begin_sim_bonus(bs, temperatures)
         self._cycle_draws_done = True
 
@@ -1722,6 +1756,42 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self.num_relayed_in_graph_steps == 1:
             logger.info("Seq lens and bonus relayed by the verify graph (first step).")
         return relay
+
+    def _device_sim_draw(self) -> SimDraw:
+        """What the verify window's launch draws (SGLANG_OPT_DSV41_DSPARK_CYCLE_RING)."""
+        if self._sim_draw is None:
+            executor = self._verify_executor
+            epilogue = executor.verify_epilogue
+            self._sim_draw = SimDraw(
+                correct_out=self._simulated_correct_len,
+                seed_out=None if epilogue is None else epilogue.sim_seed_buf,
+                counter=torch.zeros((1,), dtype=torch.int64, device=self.device),
+                seed=self.target_worker.random_seed or 0,
+                acc_len=self._simulate_acc_len,
+                method=SIMULATE_ACC_METHOD,
+                max_len=executor.gamma + 1,
+            )
+            logger.info(
+                "DSpark simulated acceptance drawn on device by the verify window "
+                "(%s, %.2f).", SIMULATE_ACC_METHOD, self._simulate_acc_len,
+            )
+        return self._sim_draw
+
+    def _begin_device_drawn_step(self, *, bs: int, simulate_bonus_sampling_info):
+        """The host part of a step whose window launch draws the simulated acceptance:
+        the bonus temperatures, staged once per batch."""
+        epilogue = self._verify_executor.verify_epilogue
+        if epilogue is not None and epilogue.simulate_fold:
+            epilogue.begin_sim_bonus(
+                bs,
+                (
+                    None
+                    if simulate_bonus_sampling_info is None
+                    else simulate_bonus_sampling_info.temperatures[:bs]
+                ),
+                seed_on_device=True,
+                owner=simulate_bonus_sampling_info,
+            )
 
     def _begin_simulated_step_ahead(self, *, bs: int, simulate_bonus_sampling_info):
         """Issued before the draft launch (neither write depends on it); a step that
