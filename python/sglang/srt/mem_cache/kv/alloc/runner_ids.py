@@ -313,8 +313,13 @@ class RunnerIds:
         positions_out: Optional[torch.Tensor] = None,
         anchor_src: Optional[torch.Tensor] = None,
         anchor_out: Optional[torch.Tensor] = None,
+        **window_outputs,
     ) -> IterationIds:
         """Gather one fixed-width speculative window, translating at its producer.
+        ``window_outputs`` go to the kernel (``assign_extend_cache_locs_uniform_func``:
+        ``out``, ``start_by_row``, ``seq_lens_out``, ``draft_positions_out``,
+        ``draft_loc_out``); with ``start_by_row``, ``seq_lens`` is the plan's lengths
+        (``seq_lens_out``) and the kernel reads ``window_outputs["start_src"]``.
 
         The virtual window stays available for accept/reclaim bookkeeping;
         draft, target and direct writers share the physical outputs. DCP and
@@ -338,10 +343,11 @@ class RunnerIds:
                         device=req_pool_indices.device,
                     )
         writes = translated or {}
+        start_src = window_outputs.pop("start_src", None)
         virtual = assign_extend_cache_locs_uniform_func(
             req_pool_indices=req_pool_indices,
             req_to_token=self.req_to_token,
-            start_offset=seq_lens,
+            start_offset=seq_lens if start_src is None else start_src,
             batch_size=req_pool_indices.numel(),
             draft_token_num=width,
             device=req_pool_indices.device,
@@ -353,6 +359,7 @@ class RunnerIds:
             positions_out=positions_out,
             anchor_src=anchor_src,
             anchor_out=anchor_out,
+            **window_outputs,
         )
         return self.plan(
             req_pool_indices=req_pool_indices,

@@ -550,18 +550,37 @@ def assign_extend_cache_locs_uniform(
     anchor_src=None,
     anchor_out=None,
     anchor_stride=0,
+    START_BY_ROW: tl.constexpr = False,
+    seq_lens_out=None,
+    draft_positions_out=None,
+    draft_loc_out=None,
+    DRAFT_WIDTH: tl.constexpr = 0,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
     draft_token_num (computed here, no end_offset tensor) and the output
-    offset is pid * draft_token_num (no cross-row prefix-sum loads)."""
+    offset is pid * draft_token_num (no cross-row prefix-sum loads).
+    START_BY_ROW: ``start_offset`` and ``anchor_src`` are indexed by the request's
+    pool row, not by pid (relay buffers); ``seq_lens_out[pid]`` gets the start.
+    ``draft_positions_out`` / ``draft_loc_out`` get the first DRAFT_WIDTH columns
+    of the positions and write locations, packed per row."""
     BLOCK_SIZE: tl.constexpr = 64
     pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    row = tl.load(req_pool_indices + pid)
+    if START_BY_ROW:
+        kv_start = tl.load(start_offset + row)
+    else:
+        kv_start = tl.load(start_offset + pid)
+    if seq_lens_out is not None:
+        tl.store(seq_lens_out + pid, kv_start)
+    token_pool = req_to_token + row * pool_len
     out_cache_ptr = out_cache_loc + pid * draft_token_num
     if anchor_out is not None:
-        tl.store(anchor_out + pid * anchor_stride, tl.load(anchor_src + pid))
+        if START_BY_ROW:
+            anchor = tl.load(anchor_src + row)
+        else:
+            anchor = tl.load(anchor_src + pid)
+        tl.store(anchor_out + pid * anchor_stride, anchor)
 
     offs = tl.arange(0, BLOCK_SIZE)
     num_loop = tl.cdiv(draft_token_num, BLOCK_SIZE)
@@ -575,6 +594,14 @@ def assign_extend_cache_locs_uniform(
                 positions_out + pid * draft_token_num + o,
                 kv_start.to(tl.int64) + o,
                 mask=mask,
+            )
+        if DRAFT_WIDTH > 0:
+            dmask = o < DRAFT_WIDTH
+            tl.store(draft_loc_out + pid * DRAFT_WIDTH + o, data, mask=dmask)
+            tl.store(
+                draft_positions_out + pid * DRAFT_WIDTH + o,
+                kv_start.to(tl.int64) + o,
+                mask=dmask,
             )
         if full_v2p is not None:
             page = data // PAGE_SIZE
@@ -609,6 +636,11 @@ def assign_extend_cache_locs_uniform_func(
     positions_out: Optional[torch.Tensor] = None,
     anchor_src: Optional[torch.Tensor] = None,
     anchor_out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    start_by_row: bool = False,
+    seq_lens_out: Optional[torch.Tensor] = None,
+    draft_positions_out: Optional[torch.Tensor] = None,
+    draft_loc_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
@@ -619,6 +651,10 @@ def assign_extend_cache_locs_uniform_func(
     per gathered token. Translation is rank-local (no DCP widening).
     ``positions_out`` ([batch, draft_token_num] int64) gets start + column and
     ``anchor_out[:, 0]`` gets ``anchor_src``, in the same launch.
+    ``out``: the int64 output to write (else a new tensor). ``start_by_row``:
+    ``start_offset`` and ``anchor_src`` are per pool row (relay buffers) and
+    ``seq_lens_out`` gets each row's start. ``draft_positions_out`` /
+    ``draft_loc_out`` ([batch, k] int64, contiguous) get the first k columns.
     """
     if full_v2p is not None:
         assert full_out is not None and full_out.numel() == batch_size * draft_token_num
@@ -630,11 +666,20 @@ def assign_extend_cache_locs_uniform_func(
             and swa_v2p.is_contiguous()
         )
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
+        out_cache_loc = (
+            torch.empty(
+                (batch_size * draft_token_num,),
+                dtype=torch.int64,
+                device=device,
+            )
+            if out is None
+            else out
         )
+        draft_width = 0
+        if draft_loc_out is not None:
+            draft_width = draft_loc_out.numel() // batch_size
+            assert draft_loc_out.is_contiguous() and draft_positions_out.is_contiguous()
+            assert draft_positions_out.numel() == draft_loc_out.numel()
         assign_extend_cache_locs_uniform[(batch_size,)](
             req_pool_indices,
             req_to_token,
@@ -653,8 +698,14 @@ def assign_extend_cache_locs_uniform_func(
             anchor_src=anchor_src,
             anchor_out=anchor_out,
             anchor_stride=0 if anchor_out is None else anchor_out.stride(0),
+            START_BY_ROW=start_by_row,
+            seq_lens_out=seq_lens_out,
+            draft_positions_out=draft_positions_out,
+            draft_loc_out=draft_loc_out,
+            DRAFT_WIDTH=draft_width,
         )
         return out_cache_loc
+    assert not start_by_row and out is None and draft_loc_out is None
 
     # NPU / CPU platforms: fall back to the end_offset-tensor path.
     assert full_v2p is None, "fused write translation requires a Triton device"

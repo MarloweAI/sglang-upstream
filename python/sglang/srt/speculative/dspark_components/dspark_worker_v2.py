@@ -72,6 +72,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
+    WindowSlots,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
@@ -185,6 +186,9 @@ class DSparkWorkerV2(BaseSpecWorker):
     _cycle_draws_done = False
     # Whether the last decode step's accept and commits ran in a graph.
     last_step_graph_accept = False
+    # SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW: the runner slots of this step's window, with
+    # the FutureMap relay its launch reads (set when the FutureMap skipped its gathers).
+    _relay_slots = None
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -316,6 +320,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._prepare_inputs_once = (
             envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
         )
+        # The window's launch writes the graph runners' input slots.
+        self._slot_window = (
+            self._prepare_inputs_once and envs.SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW.get()
+        )
         self.num_folded_verify_ids_steps = 0
         self.num_relayed_in_graph_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -395,6 +403,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
+        self._proposer.use_runner_input_slot = self._slot_window
         self._verify_epilogue = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
         # Counter-based draws from the server seed: every TP rank draws the same coins,
@@ -759,6 +768,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            verify_ids_out=(
+                self._target_input_slot("input_ids") if self._slot_window else None
+            ),
         )
 
     def clear_cache_pool(self):
@@ -1075,6 +1087,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             if batch.seq_lens_cpu is not None
             else draft_input.nxt_kv_lens_cpu
         )
+        slots, self._relay_slots = self._relay_slots, None
+        if slots is None and anchor_ids is not None and self._slot_window:
+            slots = self._window_slots(bs, relay=None)
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -1083,8 +1098,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
             seq_lens_cpu=window_seq_lens_cpu,
-            bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
+            bonus=(
+                draft_input.bonus_tokens.view(-1)
+                if anchor_ids is not None
+                and (slots is None or slots.relay is None)
+                else None
+            ),
             anchor_ids=anchor_ids,
+            slots=slots,
+            draft_width=self._proposer.query_token_num,
         )
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
@@ -1433,6 +1455,64 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _graph_slot(self, runner, name: str) -> Optional[torch.Tensor]:
+        registry = getattr(runner, "buffer_registry", None)
+        if registry is None or not registry.has_slot(name):
+            return None
+        return registry.get_slot(name).buffer
+
+    def _target_input_slot(self, name: str) -> Optional[torch.Tensor]:
+        """A target decode graph runner's input slot (looked up each time: a
+        recapture may replace the runner)."""
+        return self._graph_slot(self.model_runner.decode_cuda_graph_runner, name)
+
+    def _window_slots(self, bs: int, relay) -> Optional[WindowSlots]:
+        """The runner slots a verify window of ``bs`` requests writes, or None when a
+        runner lacks one or it is too small."""
+        target = self.model_runner.decode_cuda_graph_runner
+        draft = self.draft_model_runner.decode_cuda_graph_runner
+        bufs = [
+            self._graph_slot(runner, name)
+            for runner, name in (
+                (target, "positions"),
+                (target, "out_cache_loc"),
+                (draft, "positions"),
+                (draft, "out_cache_loc"),
+                (target, "seq_lens"),
+            )
+        ]
+        w, q = self.verify_num_draft_tokens, self._proposer.query_token_num
+        if any(b is None or b.dtype != torch.int64 for b in bufs) or min(
+            bufs[0].numel() // w, bufs[1].numel() // w,
+            bufs[2].numel() // q, bufs[3].numel() // q, bufs[4].numel(),
+        ) < bs:
+            return None
+        return WindowSlots(*bufs, relay=relay)
+
+    def relay_lengths_in_step(self, batch: ScheduleBatch, future_map) -> Optional[torch.Tensor]:
+        """FutureMap hook (SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW): for a static decode
+        step, the seq lens tensor the step's window launch fills from the FutureMap's
+        relay buffers, so the FutureMap skips its seq-lens and bonus gathers; None
+        otherwise."""
+        if not (
+            self._hosts_draft
+            and self._slot_window
+            and self._prepare_inputs_once
+            and self._verify_planner.mode_value == "static"
+            and not get_parallel().attn_dp_enabled
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+        ):
+            return None
+        bs = len(batch.reqs)
+        slots = self._window_slots(
+            bs, relay=(future_map.new_seq_lens_buf, future_map.output_tokens_buf)
+        )
+        if slots is None:
+            return None
+        self._relay_slots = slots
+        return slots.seq_lens[:bs]
 
     def _cycle_sampling(self, batch: ScheduleBatch):
         """(sampling_info, simulate_bonus_sampling_info) as ``_forward_decode`` derives

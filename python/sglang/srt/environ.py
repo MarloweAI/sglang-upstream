@@ -1953,6 +1953,10 @@ class Envs:
     # draft, verify prep, verify, accept and commits) for decode batches of at most
     # SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS requests; other batches take the per-stage graphs.
     SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH = EnvBool(False)
+    # DSpark static decode: the verify window's launch writes the draft and verify graph
+    # runners' input slots (and reads the FutureMap relay itself), so their fills copy
+    # nothing; the draft sampler writes the verify ids into the verify runner's slot.
+    SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW = EnvBool(False)
     SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS = EnvInt(1)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
