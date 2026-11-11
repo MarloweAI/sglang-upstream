@@ -819,15 +819,17 @@ class DsparkVerifyEpilogue:
         folds = self.folds_commit
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
+        relay = self._future_relay_rows(bs) if self._post_fold else None
         committed_engram = self._commit_engram_history(
             io.candidates,
             io.req_pool_indices,
             self.commit_lens_buf[:bs],
             verify_lens,
             gate,
+            relay=relay,
         )
-        if self._post_fold:
-            self._scatter_future_relay(io.req_pool_indices, bs)
+        if relay is not None and not committed_engram:
+            self._scatter_future_relay(io.req_pool_indices, relay)
         if not folds:
             return committed_engram
         cache_loc = io.out_cache_loc
@@ -1012,10 +1014,11 @@ class DsparkVerifyEpilogue:
             self.deferred_commit.note_static_verify(bs)
 
     def _commit_engram_history(
-        self, candidates, req_pool_indices, commit_lens, verify_lens, gate
+        self, candidates, req_pool_indices, commit_lens, verify_lens, gate, *, relay
     ) -> bool:
         """The post-verify engram history commit, gated per row: padded rows
-        (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
+        (verify_lens 0) and steps the graph does not commit (gate 0) are skipped.
+        The same launch stores the ``relay`` rows (``_future_relay_rows``)."""
         history = self.engram_history()
         if history is None:
             return False
@@ -1026,26 +1029,39 @@ class DsparkVerifyEpilogue:
             commit_lens,
             live_rows=verify_lens,
             gate=gate,
+            relay=relay,
         )
         return True
 
-    def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
-        """Unconditional: a step that takes another accept publishes and stashes on
-        the host afterwards. Padded rows index slot 0, every pool's dummy row."""
+    def _future_relay_rows(self, bs: int):
+        """(relay seq lens, relay bonus, new seq lens, bonus) of the FutureMap's slots
+        a static step stores, or None without a commit context."""
         if self.commit_ctx is None:
-            return
+            return None
         if self.future_relay is None:
             assert not (
                 torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
             ), "the future relay is built at a warmup, before capture"
             self.future_relay = FutureRelayBuffers(
                 req_pool_size=self.commit_ctx.resolve_req_to_token().shape[0],
-                device=req_pool_indices.device,
+                device=self.new_seq_lens_buf.device,
             )
             offer_future_relay_buffers(self.future_relay)
-        rows = req_pool_indices[:bs].to(torch.int64)
-        self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
-        self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
+        return (
+            self.future_relay.new_seq_lens,
+            self.future_relay.output_tokens,
+            self.new_seq_lens_buf[:bs],
+            self.bonus_buf[:bs],
+        )
+
+    @staticmethod
+    def _scatter_future_relay(req_pool_indices: torch.Tensor, relay) -> None:
+        """Unconditional: a step that takes another accept publishes and stashes on
+        the host afterwards. Padded rows index slot 0, every pool's dummy row."""
+        relay_lens, relay_tokens, new_lens, bonus = relay
+        rows = req_pool_indices[: new_lens.shape[0]].to(torch.int64)
+        relay_lens[rows] = new_lens
+        relay_tokens[rows] = bonus
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
