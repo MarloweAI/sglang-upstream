@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Callable, Optional
 
@@ -44,6 +45,7 @@ class DsparkDraftSampler:
         greedy_draft: bool,
         out=None,
         megakernel_sampler: Optional[Callable] = None,
+        verify_ids_out: Optional[torch.Tensor] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -63,9 +65,20 @@ class DsparkDraftSampler:
         # graph tail, so the step skips its eager concat (SGLANG_OPT_DSV41_DSPARK_MID_FOLD).
         self.verify_ids: Optional[torch.Tensor] = None
         if envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
-            self.verify_ids = torch.empty(
-                (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
-            )
+            width = self.max_bs * (self.gamma + 1)
+            if (
+                verify_ids_out is not None
+                and verify_ids_out.numel() >= width
+                and verify_ids_out.dtype == torch.int64
+            ):
+                # The target verify runner's input_ids slot: its fill copies nothing.
+                self.verify_ids = verify_ids_out[:width].view(
+                    self.max_bs, self.gamma + 1
+                )
+            else:
+                self.verify_ids = torch.empty(
+                    (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
+                )
         confidence_head = model.confidence_head
         if confidence_head is None:
             self.confidence_out = self.confidence_raw_out = None
@@ -93,6 +106,7 @@ class DsparkDraftSampler:
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
         self._megakernel_steps = None
+        self._megakernel_writes_verify_ids = False
         if megakernel_sampler is not None:
             self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
 
@@ -105,6 +119,13 @@ class DsparkDraftSampler:
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             )
+        extra = {}
+        if (
+            self.verify_ids is not None
+            and "verify_ids" in inspect.signature(megakernel_sampler).parameters
+        ):
+            # the megakernel's step writes the verify ids too: the tail's concat goes
+            extra["verify_ids"] = self.verify_ids
         steps = megakernel_sampler(
             gamma=self.gamma,
             max_bs=self.max_bs,
@@ -113,6 +134,10 @@ class DsparkDraftSampler:
             draft_tokens=self.out,
             step_logits=self.step_logits,
             step_temperatures=self.params.step_temperatures,
+            **extra,
+        )
+        self._megakernel_writes_verify_ids = bool(
+            getattr(steps, "writes_verify_ids", False)
         )
         # A rank on SGLang's block would wait in its per-step token sync (this group),
         # which the megakernel's step skips.
@@ -121,6 +146,16 @@ class DsparkDraftSampler:
             served, what="draft sampler batch sizes", group=get_dp_tp_group()
         )
         return steps
+
+    def whole_step_logits(self, bs: int) -> Optional[torch.Tensor]:
+        """The step logits' whole rows of the last block, ``[:bs]``: a megakernel step that
+        keeps only its rank's columns (``gathers_step_logits``) gathers them here."""
+        if self.step_logits is None:
+            return None
+        steps = self._megakernel_steps
+        if steps is not None and steps(bs) is not None and hasattr(steps, "gather_step_logits"):
+            steps.gather_step_logits(bs)
+        return self.step_logits[:bs]
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -170,7 +205,9 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
-        if self.verify_ids is not None:
+        if self.verify_ids is not None and not (
+            step is not None and self._megakernel_writes_verify_ids
+        ):
             torch.cat(
                 [anchor.view(bs, 1), self.out[: bs * self.gamma].view(bs, self.gamma)],
                 dim=1,
@@ -213,6 +250,7 @@ def maybe_build_draft_sampler(
     greedy_draft: bool,
     tp_sync: SpecTpSync,
     out=None,
+    verify_ids_out: Optional[torch.Tensor] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -243,4 +281,5 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         out=out,
         megakernel_sampler=megakernel_sampler,
+        verify_ids_out=verify_ids_out,
     )

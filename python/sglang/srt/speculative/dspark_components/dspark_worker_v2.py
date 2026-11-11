@@ -9,11 +9,13 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -69,8 +71,10 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
     InfoSegment,
 )
+from sglang.kernels.ops.speculative.cache_locs import SimDraw
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
+    WindowSlots,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
@@ -80,17 +84,20 @@ from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph impor
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
+    candidate_request_length_bound,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     target_model_type,
     target_uses_fused_argmax,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_METHOD,
     GrammarTree,
     build_grammar_vocab_mask,
     draft_pp_context,
@@ -106,6 +113,16 @@ from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _debug_observers_read_verify_logits() -> bool:
+    """A DSpark step observer reading the verify logits after a folded accept."""
+    return bool(
+        envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+        or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
+        or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get() > 0
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +177,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
     _sampling_accept_graph = None
+    _sampled_verify_runner = None
     _rejection_noise = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
@@ -167,6 +185,13 @@ class DSparkWorkerV2(BaseSpecWorker):
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
+    # SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH: the cycle graph made this step's host draws.
+    _cycle_draws_done = False
+    # Whether the last decode step's accept and commits ran in a graph.
+    last_step_graph_accept = False
+    # SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW: the runner slots of this step's window, with
+    # the FutureMap relay its launch reads (set when the FutureMap skipped its gathers).
+    _relay_slots = None
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -298,6 +323,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._prepare_inputs_once = (
             envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
         )
+        # The window's launch writes the graph runners' input slots.
+        self._slot_window = (
+            self._prepare_inputs_once and envs.SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW.get()
+        )
         self.num_folded_verify_ids_steps = 0
         self.num_relayed_in_graph_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -361,6 +390,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._simulate_acc_len > 0
             else None
         )
+        # SGLANG_OPT_DSV41_DSPARK_CYCLE_RING: the verify window's launch draws the
+        # simulated acceptance and bonus seed (static slot-window steps, keyed by a
+        # device step counter); set up once
+        # the verify executor exists (_sim_draw).
+        self._device_draws = (
+            envs.SGLANG_OPT_DSV41_DSPARK_CYCLE_RING.get()
+            and self._slot_window
+            and self._simulated_correct_len is not None
+        )
+        self._sim_draw = None
+        self.last_step_device_draw = False
         # The simulated acceptance draw (and sim bonus seed) before the draft launch,
         # where the host waits on the previous verify anyway; off with real acceptance.
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
@@ -377,13 +417,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
+        self._proposer.use_runner_input_slot = self._slot_window
         self._verify_epilogue = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
         # Counter-based draws from the server seed: every TP rank draws the same coins,
         # so no accept broadcast is needed.
         self._rejection_noise = (
             make_rejection_noise(self.target_worker.random_seed, self.device)
-            if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
+            if is_cuda_alike() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
             else None
         )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
@@ -429,6 +470,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
+                random_seed=self.target_worker.random_seed,
+                compact_verify=self._verify_planner.is_compact_mode,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -454,17 +497,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported
-                and is_cuda()
+                and is_cuda_alike()
             ):
                 self._sampling_accept_graph = DsparkSamplingAcceptGraph(
                     epilogue=self._verify_epilogue,
                     resolve_draft_sampler=lambda: self._draft_sampler,
-                    tp_sync=self._tp_sync,
+                    # The epilogue's: the graph accept site as the static fold sees it.
+                    tp_sync=self._verify_epilogue._tp_sync,
                     fused_argmax=target_is_dsv41,
                     block_verification=get_spec().speculative_use_block_verification,
                     device=self.device,
                     rejection_noise=self._rejection_noise,
                 )
+
+        if self._verify_epilogue is not None:
+            self._verify_epilogue.target_logits_processor = (
+                self._defer_greedy_verify_gather()
+            )
 
         self._simulate_acc_greedy = (
             self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
@@ -515,6 +564,40 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _defer_greedy_verify_gather(self) -> Optional[LogitsProcessor]:
+        """The target's LogitsProcessor, its "greedy" verify variant graphs set to
+        keep the rank's vocab shard, when the static epilogue's one-launch accept tail
+        reads those graphs' logits at every batch size and the steps it does not fold
+        gather them (run_non_compact); else None. The same on every rank."""
+        epilogue = self._verify_epilogue
+        low, high = epilogue._accept_tail_bs
+        max_bs = epilogue.max_bs
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if (
+            len(processors) != 1
+            or not epilogue._fused_accept_tail
+            or low > 1
+            or (high != 0 and high < max_bs)
+            or self._verify_planner.mode_value != "static"
+            or ragged_verify_compact_enabled()
+            or _debug_observers_read_verify_logits()
+        ):
+            return None
+        processors[0].defer_greedy_verify_gather = True
+        # The sampling-accept region's accept on the shard (block-wise draws alike on
+        # every rank, no accept broadcast).
+        processors[0].defer_sampled_verify_gather = (
+            epilogue.sampled_accept_on_shard
+            and self._sampling_accept_graph is not None
+            and self._rejection_noise is not None
+            and not epilogue._tail_broadcasts
+        )
+        return processors[0]
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -707,6 +790,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None
                 else None
+            ),
+            verify_ids_out=(
+                self._target_input_slot("input_ids") if self._slot_window else None
             ),
         )
 
@@ -1024,6 +1110,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             if batch.seq_lens_cpu is not None
             else draft_input.nxt_kv_lens_cpu
         )
+        slots, self._relay_slots = self._relay_slots, None
+        if slots is None and anchor_ids is not None and self._slot_window:
+            slots = self._window_slots(bs, relay=None)
+        prewritten = slots is not None and slots.verify_loc32 is not None
+        # The window's launch draws this step's simulated acceptance.
+        device_draw = self._device_draws and slots is not None
+        for model_runner in (self.model_runner, self.draft_model_runner):
+            if hasattr(model_runner.attn_backend, "mark_out_loc_prewritten"):
+                model_runner.attn_backend.mark_out_loc_prewritten(
+                    bs if prewritten else None
+                )
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -1032,9 +1129,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
             seq_lens_cpu=window_seq_lens_cpu,
-            bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
+            bonus=(
+                draft_input.bonus_tokens.view(-1)
+                if anchor_ids is not None
+                and (slots is None or slots.relay is None)
+                else None
+            ),
             anchor_ids=anchor_ids,
+            slots=slots,
+            draft_width=self._proposer.query_token_num,
+            sim_draw=self._device_sim_draw() if device_draw else None,
         )
+        self.last_step_device_draw = device_draw
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
             self._verify_inputs_ready.record()
@@ -1059,7 +1165,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 and not sampling_info.need_min_p_sampling
             ):
                 sampling_info = None
-        if self._sim_draw_ahead:
+        if device_draw and not self._cycle_draws_done:
+            self._begin_device_drawn_step(
+                bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
+            )
+        elif self._sim_draw_ahead and not self._cycle_draws_done:
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
             )
@@ -1139,7 +1249,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             and not batch.has_grammar
         )
-        if not self._sim_draw_ahead:
+        if (
+            not self._sim_draw_ahead
+            and not self._cycle_draws_done
+            and not device_draw
+        ):
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
                 self._verify_executor.verify_epilogue.begin_sim_bonus(
@@ -1151,6 +1265,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 )
         prepare_mamba_track_for_verify(batch)
+        # SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT: a step the sampling-accept graph serves
+        # replays the verify variant without the greedy epilogue.
+        sampled_runner = self._sampled_runner()
+        sampled_variant = (
+            sampled_runner is not None
+            and not fold_eligible
+            and not run_compact
+            and self._sampling_graph_eligible(
+                batch=batch,
+                proposal_folded=proposal.folded,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        )
+        if sampled_runner is not None:
+            sampled_runner.verify_sampled_next = sampled_variant
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1176,6 +1306,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    # Nothing after a folded static accept reads the logits.
+                    keep_verify_shard=(
+                        fold_eligible
+                        and self._verify_planner.mode_value == "static"
+                        and not batch.return_logprob
+                        and (
+                            sampling_info is None
+                            or sampling_info.sampling_mask_batch_indices is None
+                        )
+                    ),
+                    keep_sampled_shard=sampled_variant and not batch.return_logprob,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1204,6 +1345,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             not folded_accept
             and can_run_cuda_graph
             and not run_compact
+            and (sampled_runner is None or sampled_variant)
             and self._sampling_graph_eligible(
                 batch=batch,
                 proposal_folded=proposal.folded,
@@ -1211,9 +1353,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
         ):
-            if simulate_bonus_sampling_info is not None:
+            if simulate_bonus_sampling_info is not None and not self._cycle_draws_done:
                 epilogue.begin_sim_bonus(
-                    bs, simulate_bonus_sampling_info.temperatures[:bs]
+                    bs,
+                    simulate_bonus_sampling_info.temperatures[:bs],
+                    seed_on_device=device_draw,
+                    owner=simulate_bonus_sampling_info,
                 )
             region_accept = self._sampling_accept_graph.run(
                 bs=bs, target_logits=logits_output.next_token_logits
@@ -1221,10 +1366,32 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
         graph_accept = folded_accept or region_accept is not None
+        self.last_step_graph_accept = graph_accept
         if region_accept is not None:
             epilogue.note_static_verify(bs)
             accept = region_accept
         else:
+            shard = (
+                None
+                if epilogue is None or logits_output.next_token_logits is None
+                else epilogue.verify_shard(logits_output.next_token_logits)
+            )
+            if shard is not None:
+                # A kept sampled-variant shard the region did not take: the whole logits.
+                logits_output.next_token_logits = shard.finish_deferred_gather(
+                    logits_output.next_token_logits
+                )
+            if (
+                not folded_accept
+                and sampling_info is not None
+                and not sampling_info.is_all_greedy
+                and draft_block.corrected_logits is not None
+                and self._draft_sampler is not None
+                and draft_block.corrected_logits.data_ptr()
+                == self._draft_sampler.step_logits.data_ptr()
+            ):
+                # The eager accept reads the folded draft's whole step logits.
+                self._draft_sampler.whole_step_logits(bs)
             accept = self._verify_executor.accept_and_finalize(
                 folded_accept=folded_accept,
                 bs=bs,
@@ -1340,7 +1507,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
             block_accept_lens=self._block_accept_lens(
-                accept=accept, folded_accept=graph_accept, bs=bs
+                accept=accept,
+                folded_accept=graph_accept,
+                bs=bs,
+                static=not run_compact
+                and self._verify_planner.mode_value == "static",
             ),
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
@@ -1350,6 +1521,232 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _graph_slot(self, runner, name: str) -> Optional[torch.Tensor]:
+        registry = getattr(runner, "buffer_registry", None)
+        if registry is None or not registry.has_slot(name):
+            return None
+        return registry.get_slot(name).buffer
+
+    def _target_input_slot(self, name: str) -> Optional[torch.Tensor]:
+        """A target decode graph runner's input slot (looked up each time: a
+        recapture may replace the runner)."""
+        return self._graph_slot(self.model_runner.decode_cuda_graph_runner, name)
+
+    def _window_slots(self, bs: int, relay) -> Optional[WindowSlots]:
+        """The runner slots a verify window of ``bs`` requests writes, or None when a
+        runner lacks one or it is too small."""
+        target = self.model_runner.decode_cuda_graph_runner
+        draft = self.draft_model_runner.decode_cuda_graph_runner
+        bufs = [
+            self._graph_slot(runner, name)
+            for runner, name in (
+                (target, "positions"),
+                (target, "out_cache_loc"),
+                (draft, "positions"),
+                (draft, "out_cache_loc"),
+                (target, "seq_lens"),
+            )
+        ]
+        w, q = self.verify_num_draft_tokens, self._proposer.query_token_num
+        if any(b is None or b.dtype != torch.int64 for b in bufs) or min(
+            bufs[0].numel() // w, bufs[1].numel() // w,
+            bufs[2].numel() // q, bufs[3].numel() // q, bufs[4].numel(),
+        ) < bs:
+            return None
+        loc32 = [
+            self._raw_out_loc_buffer(runner, model_runner, bs, width)
+            for runner, model_runner, width in (
+                (target, self.model_runner, w),
+                (draft, self.draft_model_runner, q),
+            )
+        ]
+        if any(b is None for b in loc32):
+            loc32 = [None, None]
+        return WindowSlots(
+            *bufs, relay=relay, verify_loc32=loc32[0], draft_loc32=loc32[1]
+        )
+
+    @staticmethod
+    def _raw_out_loc_buffer(runner, model_runner, bs: int, width: int):
+        """The captured raw metadata write locations of ``runner``'s graph for ``bs``
+        requests when the window's launch can write them: an unpadded graph, write
+        locations not translated, an attention backend that offers them."""
+        backend = model_runner.attn_backend
+        full = model_runner.runner_ids.space(IdSpaceKind.FULL)
+        if (
+            not hasattr(backend, "raw_out_loc_buffer")
+            or (full is not None and full.write is not None)
+            or runner._pad_to_bucket(bs, runner.capture_bs) != bs
+        ):
+            return None
+        loc = backend.raw_out_loc_buffer(bs)
+        if loc is None or loc.numel() != bs * width:
+            return None
+        return loc
+
+    def relay_lengths_in_step(self, batch: ScheduleBatch, future_map) -> Optional[torch.Tensor]:
+        """FutureMap hook (SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW): for a static decode
+        step, the seq lens tensor the step's window launch fills from the FutureMap's
+        relay buffers, so the FutureMap skips its seq-lens and bonus gathers; None
+        otherwise."""
+        if not (
+            self._hosts_draft
+            and self._slot_window
+            and self._prepare_inputs_once
+            and self._verify_planner.mode_value == "static"
+            and not get_parallel().attn_dp_enabled
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+        ):
+            return None
+        bs = len(batch.reqs)
+        slots = self._window_slots(
+            bs, relay=(future_map.new_seq_lens_buf, future_map.output_tokens_buf)
+        )
+        if slots is None:
+            return None
+        self._relay_slots = slots
+        return slots.seq_lens[:bs]
+
+    def _cycle_sampling(self, batch: ScheduleBatch):
+        """(sampling_info, simulate_bonus_sampling_info) as ``_forward_decode`` derives
+        them for this batch."""
+        sampling_info = batch.sampling_info
+        if (
+            self._simulated_correct_len is None
+            or sampling_info is None
+            or sampling_info.is_all_greedy
+        ):
+            return sampling_info, None
+        simulate_bonus = sampling_info
+        if (
+            self._simulate_acc_greedy
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        ):
+            sampling_info = None
+        return sampling_info, simulate_bonus
+
+    def cycle_graph_eligible(self, batch: ScheduleBatch) -> bool:
+        """A decode step that one cycle graph (SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH)
+        reproduces: the static verify, the folded draft proposal and an accept in a
+        graph (the greedy fold, or the sampling-accept graph after the epilogue-free
+        verify variant with block-wise rejection), no grammar, logprobs or hidden
+        states. Decided from the batch alone."""
+        if not (
+            self._hosts_draft
+            and self._verify_epilogue is not None
+            and self._draft_sampler is not None
+            and self._verify_planner.mode_value == "static"
+            and get_parallel().pp_size == 1
+            and not get_parallel().attn_dp_enabled
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and not batch.return_hidden_states
+            and batch.sampling_info is not None
+            and verify_logits_adjustments_are_noop(batch.sampling_info)
+        ):
+            return False
+        sampling_info, simulate_bonus = self._cycle_sampling(batch)
+        if sampling_info is None or sampling_info.is_all_greedy:
+            return simulate_bonus is None or self._verify_epilogue.simulate_fold
+        return (
+            self._sampled_runner() is not None
+            and self._rejection_noise is not None
+            and self._sampling_graph_eligible(
+                batch=batch,
+                proposal_folded=True,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus,
+            )
+        )
+
+    def cycle_graph_greedy(self, batch: ScheduleBatch) -> bool:
+        """Whether a served step accepts in the verify graph's greedy fold (else in the
+        sampling-accept graph)."""
+        sampling_info, _ = self._cycle_sampling(batch)
+        return sampling_info is None or sampling_info.is_all_greedy
+
+    def cycle_graph_variant(self, batch: ScheduleBatch) -> Optional[str]:
+        """The target verify graph's attention variant this step replays, from the same
+        host lengths the verify batch carries: the allocated lengths, or without them
+        the requests' length bound."""
+        runner = self.model_runner.decode_cuda_graph_runner
+        variants = getattr(runner, "attention_graph_variants", None)
+        if variants is None:
+            return None
+        bs = len(batch.reqs)
+        if not runner._attention_varies_at(runner._pad_to_bucket(bs, runner.capture_bs)):
+            return None
+        allocated = getattr(batch.spec_info, "nxt_kv_lens_cpu", None)
+        if (
+            not self._verify_executor._verify_backend_self_adds_seq_lens()
+            and allocated is not None
+        ):
+            longest = int(allocated[:bs].max())
+        else:
+            longest = candidate_request_length_bound(
+                batch.reqs, self.verify_num_draft_tokens
+            )
+        return variants.select_for_max_seq_len(longest)
+
+    def last_verify_variant(self) -> Optional[str]:
+        """The attention variant of the target verify graph key last replayed."""
+        key = getattr(self.model_runner.decode_cuda_graph_runner, "_replay_graph_key", None)
+        return getattr(key, "attention_variant", None)
+
+    def begin_cycle_step(self, batch: ScheduleBatch, device_draw: bool = False) -> None:
+        """Before a cycle graph's capture or launch: this step's host draws of the
+        simulated acceptance and bonus seed, in ``_forward_decode``'s order, which then
+        skips them. ``device_draw``: the recording's window launch draws them; only the
+        bonus temperatures are staged."""
+        bs = len(batch.reqs)
+        _, simulate_bonus = self._cycle_sampling(batch)
+        greedy = self.cycle_graph_greedy(batch)
+        epilogue = self._verify_epilogue
+        temperatures = (
+            None if simulate_bonus is None else simulate_bonus.temperatures[:bs]
+        )
+        if device_draw:
+            if epilogue.simulate_fold or (not greedy and simulate_bonus is not None):
+                epilogue.begin_sim_bonus(
+                    bs, temperatures, seed_on_device=True, owner=simulate_bonus
+                )
+        elif self._sim_draw_ahead:
+            self._begin_simulated_step_ahead(
+                bs=bs, simulate_bonus_sampling_info=simulate_bonus
+            )
+        else:
+            self._verify_executor.begin_simulated_step()
+            if greedy and epilogue.simulate_fold:
+                epilogue.begin_sim_bonus(bs, temperatures)
+        if not greedy and simulate_bonus is not None and not device_draw:
+            epilogue.begin_sim_bonus(bs, temperatures)
+        self._cycle_draws_done = True
+
+    def end_cycle_step(self) -> None:
+        self._cycle_draws_done = False
+
+    def _sampled_runner(self):
+        """The target's decode graph runner when it captured the sampled verify
+        variants (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT), else None. Looked up each
+        step: a recapture replaces the runner, and the old one's flag reaches no replay."""
+        runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
+        if (
+            runner is None
+            or not getattr(runner, "sampled_verify_variant", False)
+            or self._sampling_accept_graph is None
+        ):
+            return None
+        if self._sampled_verify_runner is None:
+            logger.info("DSpark: sampled verify steps replay the epilogue-free variant.")
+        self._sampled_verify_runner = runner
+        return runner
 
     def _sampling_graph_eligible(
         self,
@@ -1391,6 +1788,42 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.info("Seq lens and bonus relayed by the verify graph (first step).")
         return relay
 
+    def _device_sim_draw(self) -> SimDraw:
+        """What the verify window's launch draws (SGLANG_OPT_DSV41_DSPARK_CYCLE_RING)."""
+        if self._sim_draw is None:
+            executor = self._verify_executor
+            epilogue = executor.verify_epilogue
+            self._sim_draw = SimDraw(
+                correct_out=self._simulated_correct_len,
+                seed_out=None if epilogue is None else epilogue.sim_seed_buf,
+                counter=torch.zeros((1,), dtype=torch.int64, device=self.device),
+                seed=self.target_worker.random_seed or 0,
+                acc_len=self._simulate_acc_len,
+                method=SIMULATE_ACC_METHOD,
+                max_len=executor.gamma + 1,
+            )
+            logger.info(
+                "DSpark simulated acceptance drawn on device by the verify window "
+                "(%s, %.2f).", SIMULATE_ACC_METHOD, self._simulate_acc_len,
+            )
+        return self._sim_draw
+
+    def _begin_device_drawn_step(self, *, bs: int, simulate_bonus_sampling_info):
+        """The host part of a step whose window launch draws the simulated acceptance:
+        the bonus temperatures, staged once per batch."""
+        epilogue = self._verify_executor.verify_epilogue
+        if epilogue is not None and epilogue.simulate_fold:
+            epilogue.begin_sim_bonus(
+                bs,
+                (
+                    None
+                    if simulate_bonus_sampling_info is None
+                    else simulate_bonus_sampling_info.temperatures[:bs]
+                ),
+                seed_on_device=True,
+                owner=simulate_bonus_sampling_info,
+            )
+
     def _begin_simulated_step_ahead(self, *, bs: int, simulate_bonus_sampling_info):
         """Issued before the draft launch (neither write depends on it); a step that
         turns out not fold-eligible ignores the sim bonus buffers."""
@@ -1412,7 +1845,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "Simulated acceptance drawn ahead of the draft launch (first step)."
             )
 
-    def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
+    def _block_accept_lens(
+        self, *, accept, folded_accept: bool, bs: int, static: bool = False
+    ):
+        # A static verify has no cutoff, so no cap trims: the block accept lengths are the
+        # commit lengths themselves (no add, and copy_to_cpu brings them back once).
+        if static:
+            return accept.commit_lens
         in_graph = (
             self._verify_epilogue.read_block_accept_lens(bs)
             if folded_accept and self._verify_epilogue is not None

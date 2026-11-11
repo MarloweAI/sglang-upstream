@@ -580,10 +580,10 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)
     # DSpark static verify: the verify graph scatters new seq lens and the bonus into
     # the FutureMap's slots; the host skips those scatters for folded accepts.
-    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(False)
+    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(True)
     # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
     # the plan-time load already copied from the same tensors.
-    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(False)
+    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(True)
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
     # draft launch instead of between the draft and the target verify.
     SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
@@ -1685,7 +1685,7 @@ class Envs:
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
     # Graph-input fill fast paths: skip the padding reset of an unpadded replay and copy
     # one dense integer dtype pair with a single foreach launch.
-    SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(False)
+    SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(True)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
@@ -1926,10 +1926,10 @@ class Envs:
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one
     # launch instead of two adds, assign_extend_cache_locs and a copy.
-    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(False)
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(True)
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
-    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(False)
+    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(True)
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
     SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(False)
@@ -1941,10 +1941,28 @@ class Envs:
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(False)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
-    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(True)
     # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
     # sampling accept and commits as a CUDA graph right after the verify graph.
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
+    # With it: each target verify graph size also captures a variant without the greedy
+    # epilogue, which a sampled step replays before the sampling-accept graph, so the
+    # greedy accept and commits are not run (gated) beside the sampled ones.
+    SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT = EnvBool(False)
+    # DSpark static decode on ROCm: one HIP graph a cycle (FutureMap resolve, draft prep,
+    # draft, verify prep, verify, accept and commits) for decode batches of at most
+    # SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS requests; other batches take the per-stage graphs.
+    SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH = EnvBool(False)
+    # DSpark static decode: the verify window's launch writes the draft and verify graph
+    # runners' input slots (and reads the FutureMap relay itself), so their fills copy
+    # nothing; the draft sampler writes the verify ids into the verify runner's slot.
+    SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW = EnvBool(False)
+    SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS = EnvInt(1)
+    # With the cycle graph and the slot window: the verify window's launch draws the
+    # simulated acceptance on device (keyed by a device step counter), and a
+    # replayed cycle returns its result through one host-enqueued copy into a pinned
+    # ring the host polls (no result or publish event a cycle).
+    SGLANG_OPT_DSV41_DSPARK_CYCLE_RING = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

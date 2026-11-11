@@ -162,6 +162,14 @@ _OPUS_PREFILL_MAX_WORKSPACE_ROWS = 1 << 20
 _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
+def _pad_tail(x: torch.Tensor, size: int) -> torch.Tensor:
+    """``x`` zero-padded to ``size`` entries; ``x`` itself when it has them (the
+    replay's slot view, so the metadata copy from it is a no-op)."""
+    if x.shape[0] == size:
+        return x
+    return F.pad(x, pad=(0, size - x.shape[0]), mode="constant", value=0)
+
+
 @dataclass
 class _OpusPrefillState:
     """OPUS prefill inputs of one forward. A V4.1 ratio-1/2 layer reads the
@@ -1918,6 +1926,33 @@ class DeepseekV4HipRadixBackend(
             workspace=metadata.fp4_prefill_workspace,
         )
 
+    # The captured TARGET_VERIFY graph key whose raw metadata write locations a
+    # producer already wrote this step (raw_out_loc_buffer), else None.
+    _prewritten_out_loc_key = None
+
+    def raw_out_loc_buffer(self, bs: int) -> Optional[torch.Tensor]:
+        """The int32 write locations of the raw metadata the TARGET_VERIFY graph of
+        ``bs`` requests captured, for a producer to write directly (then
+        ``mark_out_loc_prewritten``); None when that graph holds no raw metadata."""
+        meta = self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.TARGET_VERIFY].get(bs)
+        if not isinstance(meta, (DSV4RawVerifyMetadata, DSV4RawDSparkDraftMetadata)):
+            return None
+        loc = meta.out_cache_loc
+        if loc.dtype != torch.int32 or not loc.is_contiguous() or loc.dim() != 1:
+            return None
+        return loc
+
+    def mark_out_loc_prewritten(self, bs: int) -> None:
+        """This step's raw_out_loc_buffer(bs) holds the write locations: the next
+        TARGET_VERIFY replay prep of ``bs`` copies none."""
+        self._prewritten_out_loc_key = bs
+
+    def _take_prewritten_out_loc(self, bs: int, in_capture: bool) -> Optional[torch.Tensor]:
+        key, self._prewritten_out_loc_key = self._prewritten_out_loc_key, None
+        if in_capture or key != bs:
+            return None
+        return self.raw_out_loc_buffer(bs)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1989,12 +2024,9 @@ class DeepseekV4HipRadixBackend(
             assert out_cache_loc is not None
             block_size = self.target_verify_num_draft_tokens
             num_tokens_v = block_size * bs
-            out_cache_loc_padded = F.pad(
-                out_cache_loc,
-                pad=(0, num_tokens_v - len(out_cache_loc)),
-                mode="constant",
-                value=0,
-            )
+            out_cache_loc_padded = self._take_prewritten_out_loc(bs, in_capture)
+            if out_cache_loc_padded is None:
+                out_cache_loc_padded = _pad_tail(out_cache_loc, num_tokens_v)
             if _DSPARK_DRAFT_RAW_METADATA:
                 temp_metadata = DSV4RawDSparkDraftMetadata(
                     req_pool_indices=req_pool_indices,
@@ -2019,12 +2051,13 @@ class DeepseekV4HipRadixBackend(
                 graph_key = num_tokens_v
             else:
                 num_tokens_v = self.target_verify_num_draft_tokens * bs
-            out_cache_loc_padded = torch.nn.functional.pad(
-                out_cache_loc,
-                pad=(0, num_tokens_v - len(out_cache_loc)),
-                mode="constant",
-                value=0,
+            out_cache_loc_padded = (
+                None
+                if ragged_layout is not None
+                else self._take_prewritten_out_loc(bs, in_capture)
             )
+            if out_cache_loc_padded is None:
+                out_cache_loc_padded = _pad_tail(out_cache_loc, num_tokens_v)
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,

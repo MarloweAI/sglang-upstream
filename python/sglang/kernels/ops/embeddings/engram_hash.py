@@ -30,13 +30,23 @@ def _engram_commit_history_kernel(
     commit_ptr,
     live_ptr,
     gate_ptr,
+    relay_lens_ptr,
+    relay_tokens_ptr,
+    new_lens_ptr,
+    bonus_ptr,
     HISTORY_STRIDE: tl.constexpr,
     HISTORY_WIDTH: tl.constexpr,
     TOKEN_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
     GATED: tl.constexpr,
+    RELAY: tl.constexpr,
 ):
     row = tl.program_id(0)
+    if RELAY:
+        # Every row, padded and ungated ones too: relay[slot] = (new seq len, bonus).
+        relay_slot = tl.load(slots_ptr + row).to(tl.int64)
+        tl.store(relay_lens_ptr + relay_slot, tl.load(new_lens_ptr + row))
+        tl.store(relay_tokens_ptr + relay_slot, tl.load(bonus_ptr + row))
     if GATED:
         # Captured rows past the live batch, or a step the graph does not commit.
         if (tl.load(live_ptr + row) == 0) | (tl.load(gate_ptr) == 0):
@@ -69,15 +79,22 @@ def engram_commit_history(
     commit_lens: torch.Tensor,
     live_rows: Optional[torch.Tensor] = None,
     gate: Optional[torch.Tensor] = None,
+    relay: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> None:
     """Update distinct live request slots with anchor + correct drafts, not bonus.
-    Skips rows whose ``live_rows`` entry is 0, and all rows when ``gate[0]`` is 0."""
+    Skips rows whose ``live_rows`` entry is 0, and all rows when ``gate[0]`` is 0.
+    ``relay`` = (relay_lens, relay_tokens, new_lens, bonus), int64: every row also
+    stores ``relay_lens[slot] = new_lens[row]`` and ``relay_tokens[slot] = bonus[row]``."""
     bs = req_slots.numel()
     width = history.shape[1]
     if bs == 0 or width == 0:
+        assert relay is None, "the relay rows are stored with the history commit"
         return
     assert history.stride(1) == 1 and verify_ids.stride(1) == 1
     assert req_slots.stride(0) == 1 and commit_lens.stride(0) == 1
+    if relay is not None:
+        assert all(t.dtype == torch.int64 and t.stride(0) == 1 for t in relay)
+        assert relay[2].numel() >= bs and relay[3].numel() >= bs
     _engram_commit_history_kernel[(bs,)](
         history,
         verify_ids,
@@ -85,11 +102,13 @@ def engram_commit_history(
         commit_lens,
         live_rows if live_rows is not None else commit_lens,
         gate if gate is not None else commit_lens,
+        *(relay if relay is not None else (commit_lens,) * 4),
         HISTORY_STRIDE=history.stride(0),
         HISTORY_WIDTH=width,
         TOKEN_STRIDE=verify_ids.stride(0),
         BLOCK=triton.next_power_of_2(width),
         GATED=live_rows is not None,
+        RELAY=relay is not None,
         num_warps=4,
     )
 

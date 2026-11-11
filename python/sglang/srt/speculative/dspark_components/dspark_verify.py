@@ -33,6 +33,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
+    simulated_bonus_shard_keys,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
@@ -43,6 +44,9 @@ from sglang.srt.managers.overlap_utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_verify_variant,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -308,7 +312,14 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        keep_verify_shard: bool = False,
+        keep_sampled_shard: bool = False,
     ) -> TargetVerifyResult:
+        """``keep_verify_shard``: the graph's folded accept is the step's only reader
+        of the logits, so a "greedy" variant graph's vocab shard stays as it is
+        (``next_token_logits`` None); ``keep_sampled_shard``: the sampling-accept region
+        reads a "sampled" variant graph's shard (``next_token_logits`` the shard);
+        otherwise the whole logits are gathered here."""
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
@@ -339,8 +350,22 @@ class TargetVerifyExecutor:
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
+        logits_output = result.logits_output
+        shard = (
+            self.verify_epilogue.verify_shard(logits_output.next_token_logits)
+            if self.verify_epilogue is not None
+            else None
+        )
+        if shard is not None and keep_sampled_shard:
+            return result
+        if shard is not None:
+            logits_output.next_token_logits = (
+                None
+                if keep_verify_shard
+                else shard.finish_deferred_gather(logits_output.next_token_logits)
+            )
 
-        if sampling_info is not None:
+        if sampling_info is not None and logits_output.next_token_logits is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -580,6 +605,11 @@ class StaticVerifyIO(msgspec.Struct, frozen=True):
 
 
 class DsparkVerifyEpilogue:
+    # Set by a kernel plugin whose _static_sampled_tail runs the temperature-sampled accept
+    # on the verify's vocab shard: the "sampled" verify variant then keeps the shard and the
+    # sampling-accept region takes that accept.
+    sampled_accept_on_shard = False
+
     def __init__(
         self,
         *,
@@ -596,8 +626,13 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_commit: Optional[DeferredContextCommit] = None,
         post_fold: bool = False,
+        random_seed: Optional[int] = None,
+        compact_verify: bool = True,
     ) -> None:
         self.max_bs = int(max_bs)
+        # The sampled sim bonus's per-step seed. Seeded from the server seed, one draw a
+        # step on every rank, so the ranks draw the same bonus without a broadcast.
+        self._sim_seed_rng = random.Random(random_seed) if random_seed is not None else random
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -633,15 +668,17 @@ class DsparkVerifyEpilogue:
         self.cap_trim_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
-        self.commit_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device=device
-        )
         self.new_seq_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
         )
-        self.out_tokens_buf = torch.zeros(
-            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        # Out tokens and commit lengths share one storage, so the step's result copy
+        # brings both back in one transfer (copy_to_cpu).
+        n_out = self.max_bs * self.stride * 8
+        results = torch.zeros(n_out + self.max_bs * 4, dtype=torch.uint8, device=device)
+        self.out_tokens_buf = (
+            results[:n_out].view(torch.int64).view(self.max_bs, self.stride)
         )
+        self.commit_lens_buf = results[n_out:].view(torch.int32)
         # Under the accept-site broadcast the fused tail serves only simulate_fold,
         # whose broadcast inputs (length, draw) the kernel can take.
         self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
@@ -660,9 +697,11 @@ class DsparkVerifyEpilogue:
         self.gated_commit_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
+        # Only a compact verify reads them: a static step's block accept lengths are
+        # its commit lengths (no cap trims).
         self.block_accept_lens_buf = (
             torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
-            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get() and compact_verify
             else None
         )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
@@ -674,6 +713,12 @@ class DsparkVerifyEpilogue:
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+        # The same per captured graph, by its logits' address: a batch size's graphs may
+        # each hold their own logits (a vocab shard), which a replay returns.
+        self.static_io_of_logits: dict[int, StaticVerifyIO] = {}
+        # The target's LogitsProcessor when its "greedy" verify variant graphs keep
+        # the rank's vocab shard (defer_greedy_verify_gather), else None.
+        self.target_logits_processor = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -719,16 +764,36 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
 
-    def begin_sim_bonus(self, bs: int, temperatures: Optional[torch.Tensor]) -> None:
-        """The step's bonus temperatures (None: greedy) and seed, before replay."""
+    _sim_temps_of = None
+
+    def begin_sim_bonus(
+        self,
+        bs: int,
+        temperatures: Optional[torch.Tensor],
+        *,
+        seed_on_device: bool = False,
+        owner=None,
+    ) -> None:
+        """The step's bonus temperatures (None: greedy) and seed, before replay.
+        ``seed_on_device``: the verify window's launch draws the seed
+        (SGLANG_OPT_DSV41_DSPARK_CYCLE_RING), and the temperatures are copied once per
+        ``owner`` (the batch's sampling info)."""
         if temperatures is None:
+            self._sim_temps_of = None
             if self._sim_greedy_bs != bs:
                 self.sim_temperatures_buf.zero_()
                 self._sim_greedy_bs = bs
             return
         self._sim_greedy_bs = None
-        self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
-        self.sim_seed_buf.fill_(random.getrandbits(31))
+        if not seed_on_device:
+            self._sim_temps_of = None
+            self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
+            self.sim_seed_buf.fill_(self._sim_seed_rng.getrandbits(31))
+            return
+        held = self._sim_temps_of
+        if held is None or held[0] is not owner or held[1] != bs:
+            self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
+            self._sim_temps_of = (owner, bs)
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
@@ -744,8 +809,14 @@ class DsparkVerifyEpilogue:
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        if capturing:
+        # The region replays after the "sampled" variant: never a vocab shard.
+        if capturing and get_capture_verify_variant() != "greedy":
             self.static_io[bs] = io
+            self.static_io_of_logits[io.logits.data_ptr()] = io
+        # The "sampled" verify variant (SGLANG_OPT_DSV41_SAMPLED_VERIFY_VARIANT) leaves
+        # the accept and commits to the sampling-accept graph replayed after it.
+        if get_capture_verify_variant() == "sampled":
+            return
         committed_engram = self.run_static(
             io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
         )
@@ -762,15 +833,17 @@ class DsparkVerifyEpilogue:
         folds = self.folds_commit
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
+        relay = self._future_relay_rows(bs) if self._post_fold else None
         committed_engram = self._commit_engram_history(
             io.candidates,
             io.req_pool_indices,
             self.commit_lens_buf[:bs],
             verify_lens,
             gate,
+            relay=relay,
         )
-        if self._post_fold:
-            self._scatter_future_relay(io.req_pool_indices, bs)
+        if relay is not None and not committed_engram:
+            self._scatter_future_relay(io.req_pool_indices, relay)
         if not folds:
             return committed_engram
         cache_loc = io.out_cache_loc
@@ -828,6 +901,26 @@ class DsparkVerifyEpilogue:
             else None
         )
 
+    def _static_sampled_tail(
+        self,
+        *,
+        candidates,
+        logits,
+        draft_logits,
+        temperatures,
+        rejection_noise,
+        seq_lens,
+        verify_lens,
+        gate,
+        gated: bool,
+    ) -> Optional[torch.Tensor]:
+        """The block-wise rejection accept (and under SGLANG_SIMULATE_ACC_LEN the simulated
+        length and bonus) of an all-sampled static step from this rank's vocab shard of the
+        verify's ``logits`` and the draft's whole ``draft_logits`` rows, into the accept
+        buffers; returns the gated commit lengths when ``gated``. A kernel plugin's
+        (``sampled_accept_on_shard``)."""
+        raise NotImplementedError("the sampled accept on a vocab shard is a kernel plugin's")
+
     def engram_history(self) -> Optional[torch.Tensor]:
         """The engram history the static epilogue commits into, or None."""
         if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
@@ -846,7 +939,19 @@ class DsparkVerifyEpilogue:
         simulate_fold the argmax is skipped and the bonus select runs in the tail."""
         bs = candidates.shape[0]
         target_predict = bonus_in = bonus_parts = None
-        if not self.simulate_fold:
+        shard = self.verify_shard(logits)
+        if shard is not None:
+            # The rank's vocab shard: the ranks' row keys, never the whole logits.
+            if self.simulate_fold:
+                bonus_in = shard.deferred_select(self._sim_bonus_shard_keys(logits, bs))
+            else:
+                target_predict = shard.deferred_argmax(logits).view(-1)
+            if self._tail_broadcasts:
+                self._tp_sync.sync(
+                    SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, self.simulated_correct_len
+                )
+                self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus_in)
+        elif not self.simulate_fold:
             target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
         elif self._tail_broadcasts:
             bonus_in = self.sim_bonus(logits, bs)
@@ -860,7 +965,9 @@ class DsparkVerifyEpilogue:
                 *simulated_bonus_partials_graph(**self._sim_bonus_args(logits, bs)),
                 logits.shape[1],
             )
-        self._log_accept_tail(bs, bonus_in=bonus_in)
+        self._log_accept_tail(
+            bs, bonus_in=bonus_in if self._tail_broadcasts else None, shard=shard
+        )
         static_accept_tail(
             candidates=candidates,
             target_predict=target_predict,
@@ -891,11 +998,33 @@ class DsparkVerifyEpilogue:
             rows_per_request=self.stride,
         )
 
+    def verify_shard(self, logits):
+        """The target's LogitsProcessor when ``logits`` is its rank's vocab shard."""
+        lp = self.target_logits_processor
+        return lp if lp is not None and lp.is_deferred_shard(logits) else None
+
+    def _sim_bonus_shard_keys(self, logits, bs: int) -> torch.Tensor:
+        col_offset, valid_width = self.target_logits_processor.deferred_shard_offset(
+            logits
+        )
+        args = self._sim_bonus_args(logits, bs)
+        return simulated_bonus_shard_keys(
+            target_logits=logits,
+            col_offset=col_offset,
+            valid_width=valid_width,
+            vocab=self.target_logits_processor.vocab_size,
+            correct_len=args["correct_len"],
+            temperatures=args["temperatures"],
+            seed=args["seed"],
+            bs=bs,
+            rows_per_request=self.stride,
+        )
+
     def sim_bonus(self, logits, bs: int) -> torch.Tensor:
         """The simulated row's bonus from the buffers begin_sim_bonus staged; graph-safe."""
         return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
 
-    def _log_accept_tail(self, bs: int, *, bonus_in) -> None:
+    def _log_accept_tail(self, bs: int, *, bonus_in, shard=None) -> None:
         """Once per captured batch size, from the branch that launches the kernel."""
         if (
             bs in self._accept_tail_logged
@@ -905,10 +1034,12 @@ class DsparkVerifyEpilogue:
             return
         self._accept_tail_logged.add(bs)
         logger.info(
-            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s)",
+            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s, "
+            "logits=%s)",
             bs,
             "sim-fold" if self.simulate_fold else "argmax",
             "inputs" if bonus_in is not None else "off",
+            "vocab shard" if shard is not None else "gathered",
         )
 
     def note_static_verify(self, bs: int) -> None:
@@ -917,10 +1048,11 @@ class DsparkVerifyEpilogue:
             self.deferred_commit.note_static_verify(bs)
 
     def _commit_engram_history(
-        self, candidates, req_pool_indices, commit_lens, verify_lens, gate
+        self, candidates, req_pool_indices, commit_lens, verify_lens, gate, *, relay
     ) -> bool:
         """The post-verify engram history commit, gated per row: padded rows
-        (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
+        (verify_lens 0) and steps the graph does not commit (gate 0) are skipped.
+        The same launch stores the ``relay`` rows (``_future_relay_rows``)."""
         history = self.engram_history()
         if history is None:
             return False
@@ -931,26 +1063,39 @@ class DsparkVerifyEpilogue:
             commit_lens,
             live_rows=verify_lens,
             gate=gate,
+            relay=relay,
         )
         return True
 
-    def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
-        """Unconditional: a step that takes another accept publishes and stashes on
-        the host afterwards. Padded rows index slot 0, every pool's dummy row."""
+    def _future_relay_rows(self, bs: int):
+        """(relay seq lens, relay bonus, new seq lens, bonus) of the FutureMap's slots
+        a static step stores, or None without a commit context."""
         if self.commit_ctx is None:
-            return
+            return None
         if self.future_relay is None:
             assert not (
                 torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
             ), "the future relay is built at a warmup, before capture"
             self.future_relay = FutureRelayBuffers(
                 req_pool_size=self.commit_ctx.resolve_req_to_token().shape[0],
-                device=req_pool_indices.device,
+                device=self.new_seq_lens_buf.device,
             )
             offer_future_relay_buffers(self.future_relay)
-        rows = req_pool_indices[:bs].to(torch.int64)
-        self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
-        self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
+        return (
+            self.future_relay.new_seq_lens,
+            self.future_relay.output_tokens,
+            self.new_seq_lens_buf[:bs],
+            self.bonus_buf[:bs],
+        )
+
+    @staticmethod
+    def _scatter_future_relay(req_pool_indices: torch.Tensor, relay) -> None:
+        """Unconditional: a step that takes another accept publishes and stashes on
+        the host afterwards. Padded rows index slot 0, every pool's dummy row."""
+        relay_lens, relay_tokens, new_lens, bonus = relay
+        rows = req_pool_indices[: new_lens.shape[0]].to(torch.int64)
+        relay_lens[rows] = new_lens
+        relay_tokens[rows] = bonus
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(

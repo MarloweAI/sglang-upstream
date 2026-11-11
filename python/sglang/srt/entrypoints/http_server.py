@@ -2499,6 +2499,24 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if model_info["is_generation"] and request_name == "/generate":
+                # A temperature-sampled request too, long enough for a speculative
+                # decode's sampled accept to run eagerly and then be captured: its
+                # kernels compile here instead of in the first sampled user request.
+                sampled = dict(json_data)
+                sampled["sampling_params"] = {
+                    "temperature": 1.0,
+                    "max_new_tokens": 32,
+                    "ignore_eos": True,
+                }
+                res = requests.post(
+                    url + request_name,
+                    json=sampled,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:

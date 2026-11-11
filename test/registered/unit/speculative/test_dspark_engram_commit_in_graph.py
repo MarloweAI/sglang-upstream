@@ -40,8 +40,48 @@ def test_gated_kernel_skips_dead_rows_and_closed_gate():
     assert torch.equal(closed, history)
 
 
-def _commit_reference(history, tokens, slots, commit, live_rows, gate):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_relay_rows_stored_with_the_commit_on_every_row():
+    """The relay rows go out with the history commit, padded rows and a closed gate
+    included, as the separate index_put scatter writes them."""
+    from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
+
+    dev = "cuda"
+    history = torch.arange(4 * 3, dtype=torch.int32, device=dev).view(4, 3)
+    tokens = torch.arange(100, 112, dtype=torch.int64, device=dev).view(2, 6)
+    slots = torch.tensor([3, 1], device=dev)
+    commit = torch.tensor([2, 4], dtype=torch.int32, device=dev)
+    new_lens = torch.tensor([811, 922], dtype=torch.int64, device=dev)
+    bonus = torch.tensor([7, 9], dtype=torch.int64, device=dev)
+    for live, gate in (([6, 6], 1), ([6, 0], 1), ([6, 6], 0)):
+        live = torch.tensor(live, device=dev)
+        gate = torch.full((1,), gate, dtype=torch.int32, device=dev)
+        plain, fused = history.clone(), history.clone()
+        engram_commit_history(plain, tokens, slots, commit, live_rows=live, gate=gate)
+        relay_lens = torch.full((5,), -1, dtype=torch.int64, device=dev)
+        relay_tokens = torch.full((5,), -1, dtype=torch.int64, device=dev)
+        engram_commit_history(
+            fused,
+            tokens,
+            slots,
+            commit,
+            live_rows=live,
+            gate=gate,
+            relay=(relay_lens, relay_tokens, new_lens, bonus),
+        )
+        ref_lens = torch.full((5,), -1, dtype=torch.int64, device=dev)
+        ref_tokens = torch.full((5,), -1, dtype=torch.int64, device=dev)
+        ref_lens[slots] = new_lens
+        ref_tokens[slots] = bonus
+        assert torch.equal(fused, plain)
+        assert torch.equal(relay_lens, ref_lens) and torch.equal(relay_tokens, ref_tokens)
+
+
+def _commit_reference(history, tokens, slots, commit, live_rows, gate, relay=None):
     """Anchor + accepted drafts into each live row's history (gate open)."""
+    if relay is not None:
+        relay[0][slots] = relay[2]
+        relay[1][slots] = relay[3]
     if int(gate[0]) == 0:
         return
     n = history.shape[1]
@@ -78,6 +118,7 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
     epi.folds_engram_commit = False
     epi.static_io = {}
     epi._post_fold = False
+    epi.target_logits_processor = None
     # No fused-norm pool: the epilogue returns right after the engram commit.
     epi.commit_ctx = SimpleNamespace(
         resolve_engram_hasher=lambda: SimpleNamespace(history=history),

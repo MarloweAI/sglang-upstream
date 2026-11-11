@@ -30,6 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_utils.graph_splice import new_cuda_graph
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -179,7 +180,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        graph = new_cuda_graph()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
