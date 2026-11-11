@@ -62,6 +62,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_verify_variant,
+)
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     get_exec,
@@ -490,6 +493,10 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        # The same for the target verify graphs captured as the "greedy" variant
+        # only (capture_verify_variant), whatever the head's output dtype: their
+        # logits are this rank's vocab shard, as the head wrote it.
+        self.defer_greedy_verify_gather = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1008,6 +1015,11 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        if self._defers_greedy_verify_shard(
+            logits, local_hidden_states, lm_head, logits_metadata
+        ):
+            return logits
+
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
         ):
@@ -1071,6 +1083,28 @@ class LogitsProcessor(nn.Module):
 
         return logits
 
+    def _can_gather_tp_shards(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        """The logits are a plain TP group's vocab shards, rank-major, which
+        _gather_softcap_fused (all-gather, then reorder) can finish."""
+        return (
+            self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and logits.is_cuda
+            and not (_is_npu or _is_cpu)
+            and logits.dim() == 2
+            and logits.is_contiguous()
+            and not self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
     def _can_gather_softcap_fused(
         self,
         logits: torch.Tensor,
@@ -1079,40 +1113,67 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> bool:
         return (
-            self.do_tensor_parallel_all_gather
-            and not self.use_attn_tp_group
-            and not self.do_tensor_parallel_all_gather_dp_attn
-            and bool(self.final_logit_softcapping)
-            and logits.is_cuda
-            and not (_is_npu or _is_cpu)
+            bool(self.final_logit_softcapping)
             and logits.dtype == torch.float32
-            and logits.dim() == 2
-            and logits.is_contiguous()
-            and not self._can_use_tp_lm_head_all_to_all(
+            and self._can_gather_tp_shards(
                 logits, local_hidden_states, lm_head, logits_metadata
             )
         )
 
-    def is_deferred_shard(self, logits: torch.Tensor) -> bool:
-        return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
+    def _defers_greedy_verify_shard(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        return (
+            self.defer_greedy_verify_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and get_capture_verify_variant() == "greedy"
+            and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and self._can_gather_tp_shards(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
+    def is_deferred_shard(self, logits: Optional[torch.Tensor]) -> bool:
+        return (
+            (self.defer_verify_gather or self.defer_greedy_verify_gather)
+            and logits is not None
+            and logits.shape[-1] < self.vocab_size
+        )
 
     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
-        """Full softcapped logits from a target-verify vocab shard."""
+        """Full fp32 (softcapped) logits from a target-verify vocab shard: the
+        values the undeferred path writes, bit for bit."""
         return self._gather_softcap_fused(logits, None, use_buffer=False)
 
-    def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        """``argmax`` of the full softcapped logits from a target-verify vocab
-        shard, gathering only each rank's row maxima. Ties resolve to the lowest
-        vocab index, as ``torch.argmax`` over the gathered row does."""
+    def deferred_shard_offset(self, logits: torch.Tensor) -> tuple[int, int]:
+        """This rank's shard: its first global vocab index and its valid width."""
         group = get_parallel().tp_group
-        num_tokens, shard_width = logits.shape
+        shard_width = logits.shape[-1]
         col_offset = group.rank_in_group * shard_width
-        valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
+        return col_offset, max(0, min(shard_width, self.vocab_size - col_offset))
+
+    def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """``argmax`` of the full fp32 (softcapped) logits from a target-verify
+        vocab shard, gathering only each rank's row maxima. Ties resolve to the
+        lowest vocab index, as ``torch.argmax`` over the gathered row does."""
+        col_offset, valid_width = self.deferred_shard_offset(logits)
         local = softcap_row_argmax(
             logits, self.final_logit_softcapping, valid_width, col_offset
         )
+        return self.deferred_select(local)
+
+    def deferred_select(self, local: torch.Tensor) -> torch.Tensor:
+        """Every rank's ``[rows, 2]`` (value, global index) row keys gathered; the
+        largest value a row, ties to the lowest index (the lower rank's)."""
+        group = get_parallel().tp_group
         gathered = torch.empty(
-            (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
+            (group.world_size,) + tuple(local.shape),
+            dtype=local.dtype,
+            device=local.device,
         )
         group.all_gather_into_tensor(gathered.view(-1, 2), local)
         best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
