@@ -71,18 +71,23 @@ def _simulated_bonus_row_partial_kernel(
     part_val_ptr,
     part_idx_ptr,
     vocab,
+    col_offset,
+    valid_width,
     ROWS: tl.constexpr,
     NSPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # The logits may be one rank's vocab shard: its columns start at the global
+    # index col_offset, and the noise is keyed by the global index.
     req = tl.program_id(0)
     split = tl.program_id(1)
     row = req * ROWS + tl.load(correct_len_ptr + req * correct_len_stride)
     t = tl.load(temperatures_ptr + req).to(tl.float32)
-    offs = split * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < vocab
+    local = split * BLOCK + tl.arange(0, BLOCK)
+    mask = local < valid_width
+    offs = col_offset + local
     x = tl.load(
-        logits_ptr + row.to(tl.int64) * logits_stride + offs,
+        logits_ptr + row.to(tl.int64) * logits_stride + local,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -112,6 +117,54 @@ def _simulated_bonus_row_select_kernel(
     tl.store(
         out_ptr + req, tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.int64)
     )
+
+
+@triton.jit
+def _simulated_bonus_row_key_kernel(
+    part_val_ptr,
+    part_idx_ptr,
+    key_ptr,
+    vocab,
+    NSPLIT: tl.constexpr,
+):
+    req = tl.program_id(0)
+    s = tl.arange(0, NSPLIT)
+    val = tl.load(part_val_ptr + req * NSPLIT + s)
+    idx = tl.load(part_idx_ptr + req * NSPLIT + s)
+    top = tl.max(val, axis=0)
+    tl.store(key_ptr + req * 2, top)
+    tl.store(
+        key_ptr + req * 2 + 1,
+        tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.float32),
+    )
+
+
+def simulated_bonus_shard_keys(
+    *,
+    target_logits: torch.Tensor,
+    col_offset: int,
+    valid_width: int,
+    vocab: int,
+    correct_len: torch.Tensor,
+    temperatures: torch.Tensor,
+    seed: torch.Tensor,
+    bs: int,
+    rows_per_request: int,
+) -> torch.Tensor:
+    """simulated_bonus_sample_graph's selection over one rank's vocab shard (columns
+    from the global index ``col_offset``, ``valid_width`` of them, of a ``vocab``-wide
+    row): per request the best (value, global index) as fp32 ``[bs, 2]``, ties to the
+    lowest index. The ranks' keys reduced the same way give the whole row's sample."""
+    assert target_logits.stride(1) == 1 and vocab < 2**24
+    part_val, part_idx = _row_partials(
+        target_logits, correct_len, temperatures, seed, bs, rows_per_request,
+        vocab=vocab, col_offset=col_offset, valid_width=valid_width,
+    )  # fmt: skip
+    keys = torch.empty((bs, 2), dtype=torch.float32, device=target_logits.device)
+    _simulated_bonus_row_key_kernel[(bs,)](
+        part_val, part_idx, keys, vocab, NSPLIT=part_val.shape[1]
+    )
+    return keys
 
 
 def simulated_bonus_sample_graph(
@@ -153,11 +206,21 @@ def simulated_bonus_partials_graph(
     """simulated_bonus_sample_graph's per-split (value, index) maxima, [bs, NSPLIT],
     reduced by ``simulated_bonus_select_partials``. ``correct_len`` may be stride-0."""
     assert target_logits.stride(1) == 1
+    vocab = target_logits.shape[1]
+    return _row_partials(
+        target_logits, correct_len, temperatures, seed, bs, rows_per_request,
+        vocab=vocab, col_offset=0, valid_width=vocab,
+    )  # fmt: skip
+
+
+def _row_partials(
+    target_logits, correct_len, temperatures, seed, bs, rows_per_request, *,
+    vocab, col_offset, valid_width,
+):  # fmt: skip
     assert correct_len.dim() == 1 and correct_len.shape[0] == bs
     device = target_logits.device
-    vocab = target_logits.shape[1]
     block = 4096
-    nsplit = triton.next_power_of_2(triton.cdiv(vocab, block))
+    nsplit = triton.next_power_of_2(triton.cdiv(valid_width, block))
     part_val = torch.empty((bs, nsplit), dtype=torch.float32, device=device)
     part_idx = torch.empty((bs, nsplit), dtype=torch.int32, device=device)
     _simulated_bonus_row_partial_kernel[(bs, nsplit)](
@@ -170,6 +233,8 @@ def simulated_bonus_partials_graph(
         part_val,
         part_idx,
         vocab,
+        col_offset,
+        valid_width,
         ROWS=rows_per_request,
         NSPLIT=nsplit,
         BLOCK=block,
