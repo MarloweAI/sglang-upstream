@@ -1,12 +1,12 @@
-"""A replayed DSpark cycle's result without per-cycle events
+"""A replayed DSpark cycle's result through a pinned ring
 (SGLANG_OPT_DSV41_DSPARK_CYCLE_RING).
 
 The static accept leaves a cycle's out tokens and commit lengths in one device span
 (``DsparkVerifyEpilogue``'s result buffers). After each cycle graph launch the host
-enqueues one copy of that span into the next row of a pinned ring, which it filled with
--1 first. The result's ``copy_done`` is a ``RingRowDone``: it waits until the row's
-commit lengths and the tokens they cover no longer read -1 (every valid value is >= 0,
-so the check holds for any order in which the copy lands). No result event, no
+enqueues one copy of that span into the next row of a pinned ring and records the row's
+event behind it; the result's ``copy_done`` is that event. The host reads a row only
+once its event completed: the copy lands no word at once (a commit length of 4 can read
+0xFFFFFF04 halfway), and a later copy on the stream can land before it. No
 ``copy_to_cpu``.
 
 The FutureMap's publish event becomes a ``LazyPublishEvent``: a replay marks the stream
@@ -19,7 +19,6 @@ from __future__ import annotations
 import ctypes
 from typing import Optional
 
-import numpy as np
 import torch
 
 _RING_ROWS = 8
@@ -75,40 +74,14 @@ class LazyPublishEvent(torch.cuda.Event):
         return super().query()
 
 
-class RingRowDone:
-    """``copy_done`` of a cycle whose result went to a ring row."""
-
-    def __init__(self, accept: np.ndarray, tokens32: np.ndarray) -> None:
-        self._accept = accept  # [bs] int32
-        self._tokens32 = tokens32  # [bs, 2 * width] int32 halves of the int64 tokens
-
-    def _landed(self) -> bool:
-        acc = self._accept
-        if (acc == -1).any():
-            return False
-        for i, n in enumerate(acc.tolist()):
-            if (self._tokens32[i, : 2 * n] == -1).any():
-                return False
-        return True
-
-    def record(self, *args, **kwargs) -> None:
-        pass
-
-    def query(self) -> bool:
-        return self._landed()
-
-    def synchronize(self) -> None:
-        while not self._landed():
-            pass
-
-
 class CycleResultRing:
-    """Pinned rows a replayed cycle's result span is copied into."""
+    """Pinned rows a replayed cycle's result span is copied into, an event a row."""
 
     def __init__(self) -> None:
         self._key = None
         self._host: Optional[torch.Tensor] = None
         self._pos = 0
+        self._done = [torch.cuda.Event() for _ in range(_RING_ROWS)]
 
     @staticmethod
     def check(result) -> None:
@@ -158,21 +131,19 @@ class CycleResultRing:
             stride = (hi - lo + 63) // 64 * 64  # rows 8-byte aligned for the token view
             self._host = torch.empty((_RING_ROWS, stride), dtype=torch.uint8, pin_memory=True)
             self._pos = 0
-        row = self._host[self._pos % _RING_ROWS, : hi - lo]
+        slot = self._pos % _RING_ROWS
+        row = self._host[slot, : hi - lo]
         self._pos += 1
         host_tokens = row[t_off - lo : t_off - lo + tokens.numel() * 8].view(torch.int64)
         host_tokens = host_tokens.view(tokens.shape)
         host_accept = row[a_off - lo : a_off - lo + accept.numel() * 4].view(torch.int32)
-        accept_np = host_accept.numpy()
-        tokens32 = host_tokens.view(torch.int32).view(accept.numel(), -1).numpy()
-        accept_np.fill(-1)
-        tokens32.fill(-1)
-        _memcpy_d2h_async(
-            row.data_ptr(), base + lo, hi - lo, torch.cuda.current_stream().cuda_stream
-        )
+        stream = torch.cuda.current_stream()
+        _memcpy_d2h_async(row.data_ptr(), base + lo, hi - lo, stream.cuda_stream)
+        done = self._done[slot]
+        done.record(stream)
         block_is_accept = result.block_accept_lens is accept
         result.next_token_ids = host_tokens
         result.accept_lens = host_accept
         if block_is_accept:
             result.block_accept_lens = host_accept
-        result.copy_done = RingRowDone(accept_np, tokens32)
+        result.copy_done = done
