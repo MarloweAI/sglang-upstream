@@ -16,8 +16,10 @@ device lengths, as it does today), the request rows from this module's static in
 buffer, sampling params from the draft sampler's static buffers. Host per step: the
 simulated-acceptance draws (benchmark only, before the launch), the launch, the result
 copy and ``process_batch_result``. With SGLANG_OPT_DSV41_DSPARK_CYCLE_RING the window
-launch draws the simulated acceptance, and the result comes back through one copy into a
-pinned ring the host polls (``dspark_cycle_ring``): no event a cycle.
+launch draws the simulated acceptance and publishes the previous cycle's result into a
+host ring (``dspark_cycle_ring``): nothing runs on the stream between two replays, and
+the host reads each cycle's tokens one cycle late, as the overlap scheduler already
+does.
 
 Which batches it serves is decided from the batch alone (``DSparkWorkerV2.
 cycle_graph_eligible`` and at most SGLANG_DSPARK_CYCLE_GRAPH_MAX_BS requests): like the
@@ -75,6 +77,8 @@ class _Recording:
         self.bonus: Optional[torch.Tensor] = None
         # The recorded window launch draws the simulated acceptance (cycle ring).
         self.device_draw = False
+        # The span the recorded window launch publishes (cycle ring), as a ring key.
+        self.publish_key: Optional[tuple] = None
         self.splice: dict = {}
         self.t0 = time.perf_counter()
 
@@ -171,6 +175,12 @@ class DsparkCycleGraph:
             self._rows_of, self._rows_in = batch.req_pool_indices, rows
         return rows[:bs]
 
+    def before_other_step(self) -> None:
+        """Before a step that is not a replay is queued: a replayed cycle still waiting
+        for its result gets it copied now (no window launch will publish it)."""
+        if self.ring is not None:
+            self.ring.before_step(None)
+
     # ---- recording -------------------------------------------------------------
 
     def begin_record(self, batch: "ScheduleBatch") -> None:
@@ -181,6 +191,10 @@ class DsparkCycleGraph:
         self.worker.begin_cycle_step(batch)
         rec = _Recording(graphs_epoch())
         rec.rows = rows
+        if self.ring is not None:
+            tokens, accept = self.worker.cycle_result_span(len(batch.reqs))
+            self.worker.cycle_publish = self.ring.publish(tokens, accept)
+            rec.publish_key = self.ring.publish_key(tokens, accept)
         self._recording = rec
         self._batch_rows = batch.req_pool_indices
         batch.req_pool_indices = rows
@@ -203,6 +217,8 @@ class DsparkCycleGraph:
         batch.req_pool_indices = self._batch_rows
         self._batch_rows = None
         self.worker.end_cycle_step()
+        published = self.worker.cycle_publish_used
+        self.worker.cycle_publish = None
         # Events recorded in the capture are never recorded on a stream.
         self.worker.model_runner.shared_read_done_event = None
         if not self.worker.last_step_graph_accept:
@@ -221,10 +237,22 @@ class DsparkCycleGraph:
         rec.device_draw = self.worker.last_step_device_draw
         if self.ring is not None:
             CycleResultRing.check(rec.result)
+            if not published:
+                raise RuntimeError(
+                    "DSpark cycle graph: the recorded window launch did not publish"
+                )
+            key = self.ring.publish_key(rec.result.next_token_ids, rec.result.accept_lens)
+            if key != rec.publish_key:
+                raise RuntimeError(
+                    "DSpark cycle graph: the step's result is not the span its window "
+                    "launch publishes"
+                )
         rec.seq_lens = batch.seq_lens
         rec.bonus = getattr(batch.spec_info, "bonus_tokens", None)
         nodes = describe_graph(rec.graph.raw_cuda_graph())
         t1 = time.perf_counter()
+        if self.ring is not None:
+            self.ring.before_step(rec.publish_key)
         rec.graph.replay()  # instantiates, then runs this step
         self._recordings[self._key] = rec
         self.num_recordings += 1
@@ -246,6 +274,8 @@ class DsparkCycleGraph:
         rec = self._recordings[self._key]
         rows = self._bind_rows(batch)
         assert rows.data_ptr() == rec.rows.data_ptr(), "the recording's rows buffer moved"
+        if self.ring is not None:
+            self.ring.before_step(rec.publish_key)
         self.worker.begin_cycle_step(batch, device_draw=rec.device_draw)
         rec.graph.replay()
         self.worker.end_cycle_step()
@@ -261,8 +291,9 @@ class DsparkCycleGraph:
             fm = self.future_map
             if not isinstance(fm.publish_ready, LazyPublishEvent):
                 fm.publish_ready = LazyPublishEvent()
-            fm.publish_ready.mark(torch.cuda.current_stream())
-            self.ring.issue(out)
+            stream = torch.cuda.current_stream()
+            fm.publish_ready.mark(stream)
+            self.ring.issue(out, stream)
         elif self.future_map.publish_ready is not None:
             self.future_map.publish_ready.record()
         self.worker.model_runner.shared_read_done_event = None

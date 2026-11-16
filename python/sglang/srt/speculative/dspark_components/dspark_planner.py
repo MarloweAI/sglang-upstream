@@ -816,11 +816,14 @@ def alloc_verify_window(
     slots: Optional[WindowSlots] = None,
     draft_width: int = 0,
     sim_draw=None,
+    publish=None,
 ) -> VerifyWindow:
     """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
     plan's read table. ``anchor_ids``, when given, gets ``bonus`` in column 0
     by the same launch (SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE). ``sim_draw``
-    (with ``slots``): the step's simulated acceptance, drawn by the same launch."""
+    (with ``slots``): the step's simulated acceptance, drawn by the same launch.
+    ``publish`` (with ``slots``): the previous step's result, written into the cycle
+    ring by the same launch."""
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = None
@@ -838,6 +841,7 @@ def alloc_verify_window(
             loc32_out=slots.verify_loc32,
             draft_loc32_out=slots.draft_loc32,
             sim_draw=sim_draw,
+            publish=publish,
         )
         if slots.relay is not None:
             # prefix_lens is slots.seq_lens[:bs]; this launch writes it.

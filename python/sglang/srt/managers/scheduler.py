@@ -4749,6 +4749,8 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
+            if self._cycle_graph is not None:
+                self._cycle_graph.before_other_step()
             return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
@@ -4762,6 +4764,9 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             cycle_route = self._cycle_graph_route(batch)
+            if cycle_route is not CycleRoute.REPLAY and self._cycle_graph is not None:
+                # nothing this step queues may run before a replayed cycle's result copy
+                self._cycle_graph.before_other_step()
             if cycle_route is CycleRoute.REPLAY:
                 batch_result = self._run_cycle_graph(batch)
             elif self.enable_overlap:

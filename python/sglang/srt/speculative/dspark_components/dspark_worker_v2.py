@@ -187,6 +187,10 @@ class DSparkWorkerV2(BaseSpecWorker):
     _verify_inputs_ready = None
     # SGLANG_OPT_DSV41_DSPARK_CYCLE_GRAPH: the cycle graph made this step's host draws.
     _cycle_draws_done = False
+    # Set by the cycle graph while it records: the window launch publishes the
+    # previous step's result into the cycle ring (``RingPublish``).
+    cycle_publish = None
+    cycle_publish_used = False
     # Whether the last decode step's accept and commits ran in a graph.
     last_step_graph_accept = False
     # SGLANG_OPT_DSV41_DSPARK_SLOT_WINDOW: the runner slots of this step's window, with
@@ -1116,6 +1120,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         prewritten = slots is not None and slots.verify_loc32 is not None
         # The window's launch draws this step's simulated acceptance.
         device_draw = self._device_draws and slots is not None
+        publish = self.cycle_publish
+        if publish is not None and (
+            slots is None or not torch.cuda.is_current_stream_capturing()
+        ):
+            # only a recording's launches publish: the ring counts their replays
+            raise RuntimeError(
+                "DSpark cycle ring: a publishing window launch outside a cycle recording"
+            )
+        self.cycle_publish_used = publish is not None
         for model_runner in (self.model_runner, self.draft_model_runner):
             if hasattr(model_runner.attn_backend, "mark_out_loc_prewritten"):
                 model_runner.attn_backend.mark_out_loc_prewritten(
@@ -1139,6 +1152,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             slots=slots,
             draft_width=self._proposer.query_token_num,
             sim_draw=self._device_sim_draw() if device_draw else None,
+            publish=publish,
         )
         self.last_step_device_draw = device_draw
         if self._verify_inputs_ready is not None:
@@ -1731,6 +1745,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def end_cycle_step(self) -> None:
         self._cycle_draws_done = False
+
+    def cycle_result_span(self, bs: int):
+        """The device span a static step's result is (out tokens, commit lengths)."""
+        epilogue = self._verify_epilogue
+        return epilogue.out_tokens_buf[:bs].reshape(-1), epilogue.commit_lens_buf[:bs]
 
     def _sampled_runner(self):
         """The target's decode graph runner when it captured the sampled verify

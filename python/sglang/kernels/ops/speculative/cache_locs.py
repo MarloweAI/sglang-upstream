@@ -564,6 +564,15 @@ def assign_extend_cache_locs_uniform(
     sim_acc_len=0.0,
     SIM_METHOD: tl.constexpr = 0,
     SIM_MAX: tl.constexpr = 1,
+    pub_tokens=None,
+    pub_accept=None,
+    ring=None,
+    ring_counter=None,
+    PUB_BS: tl.constexpr = 0,
+    PUB_N: tl.constexpr = 0,
+    PUB_BS_P2: tl.constexpr = 1,
+    PUB_N_P2: tl.constexpr = 1,
+    RING_ROWS: tl.constexpr = 1,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
@@ -578,9 +587,27 @@ def assign_extend_cache_locs_uniform(
     correct length into ``sim_correct_out`` (acceptance length in [1, SIM_MAX], minus 1)
     and a 31-bit bonus seed into ``sim_seed_out``, from Philox keyed by ``sim_seed`` and
     the step counter ``sim_counter``, which it advances: the same on every rank, and the
-    same sequence on the per-stage and cycle-graph paths."""
+    same sequence on the per-stage and cycle-graph paths.
+    PUB_BS > 0: program 0 also publishes the previous step's result, the PUB_BS commit
+    lengths at ``pub_accept`` and the PUB_N out tokens at ``pub_tokens``, into the next
+    row of ``ring`` (host memory, RING_ROWS rows of PUB_BS + PUB_N words): one 8-byte
+    word a value, its low half the value and its high half the row's tag, so a reader
+    takes a row whose every word carries the tag it expects, whatever order the words
+    land in. ``ring_counter`` counts the rows written; row c has tag c % (2**31 - 1) + 1."""
     BLOCK_SIZE: tl.constexpr = 64
     pid = tl.program_id(axis=0)
+    if PUB_BS > 0:
+        if pid == 0:
+            written = tl.load(ring_counter)
+            tag = (written % 2147483647 + 1) << 32
+            row_ptr = ring + (written % RING_ROWS) * (PUB_BS + PUB_N)
+            b = tl.arange(0, PUB_BS_P2)
+            acc = tl.load(pub_accept + b, mask=b < PUB_BS, other=0).to(tl.int64)
+            tl.store(row_ptr + b, tag | (acc & 0xFFFFFFFF), mask=b < PUB_BS)
+            k = tl.arange(0, PUB_N_P2)
+            tok = tl.load(pub_tokens + k, mask=k < PUB_N, other=0).to(tl.int64)
+            tl.store(row_ptr + PUB_BS + k, tag | (tok & 0xFFFFFFFF), mask=k < PUB_N)
+            tl.store(ring_counter, written + 1)
     row = tl.load(req_pool_indices + pid)
     if START_BY_ROW:
         kv_start = tl.load(start_offset + row)
@@ -692,6 +719,40 @@ class SimDraw:
         )
 
 
+class RingPublish:
+    """What the verify window's launch publishes into a host ring row
+    (SGLANG_OPT_DSV41_DSPARK_CYCLE_RING): ``tokens`` ([bs, w] int64) and ``accept``
+    ([bs] int32), the previous step's result span on the device; ``ring`` an object with
+    ``data_ptr()`` and ``dtype`` int64, the rows in host memory the device writes;
+    ``counter`` ([1] int64, device) the rows written so far."""
+
+    def __init__(self, *, tokens, accept, ring, counter, rows: int):
+        assert tokens.dtype == torch.int64 and accept.dtype == torch.int32
+        assert tokens.is_contiguous() and accept.is_contiguous()
+        self.tokens = tokens
+        self.accept = accept
+        self.ring = ring
+        self.counter = counter
+        self.rows = int(rows)
+
+    @property
+    def row_words(self) -> int:
+        return self.accept.numel() + self.tokens.numel()
+
+    def kernel_args(self) -> dict:
+        return dict(
+            pub_tokens=self.tokens,
+            pub_accept=self.accept,
+            ring=self.ring,
+            ring_counter=self.counter,
+            PUB_BS=self.accept.numel(),
+            PUB_N=self.tokens.numel(),
+            PUB_BS_P2=next_power_of_2(self.accept.numel()),
+            PUB_N_P2=next_power_of_2(self.tokens.numel()),
+            RING_ROWS=self.rows,
+        )
+
+
 def assign_extend_cache_locs_uniform_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -716,6 +777,7 @@ def assign_extend_cache_locs_uniform_func(
     loc32_out: Optional[torch.Tensor] = None,
     draft_loc32_out: Optional[torch.Tensor] = None,
     sim_draw=None,
+    publish=None,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
@@ -732,6 +794,8 @@ def assign_extend_cache_locs_uniform_func(
     ``draft_loc_out`` ([batch, k] int64, contiguous) get the first k columns;
     ``loc32_out`` / ``draft_loc32_out`` (int32, contiguous) the same write locations.
     ``sim_draw`` (``SimDraw``): the step's simulated acceptance drawn in the same launch.
+    ``publish`` (``RingPublish``): the previous step's result written into a host ring
+    row by the same launch.
     """
     if full_v2p is not None:
         assert full_out is not None and full_out.numel() == batch_size * draft_token_num
@@ -783,10 +847,12 @@ def assign_extend_cache_locs_uniform_func(
             loc32_out=loc32_out,
             draft_loc32_out=draft_loc32_out,
             **({} if sim_draw is None else sim_draw.kernel_args()),
+            **({} if publish is None else publish.kernel_args()),
         )
         return out_cache_loc
     assert not start_by_row and out is None and draft_loc_out is None and loc32_out is None
     assert sim_draw is None, "the device draw requires a Triton device"
+    assert publish is None, "the ring publish requires a Triton device"
 
     # NPU / CPU platforms: fall back to the end_offset-tensor path.
     assert full_v2p is None, "fused write translation requires a Triton device"
